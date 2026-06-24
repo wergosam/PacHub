@@ -44,6 +44,18 @@ class pachubApp(Adw.Application):
             "rate_mirrors":  self.win._on_rate_mirrors,
             "orphans":       self.win._on_show_orphans,
             "sysinfo":       self.win._on_show_sysinfo,
+            "history":       self.win._on_show_history,
+            "pacdiff":       self.win._on_show_pacdiff,
+            "export_pkgs":   self.win._on_export_pkgs,
+            "import_pkgs":   self.win._on_import_pkgs,
+            "pkgbuild":      self.win._on_view_pkgbuild,
+            "hold":          self.win._on_toggle_hold,
+            "mark_explicit": self.win._on_mark_explicit,
+            "mark_asdeps":   self.win._on_mark_asdeps,
+            "preferences":   self.win._on_preferences,
+            "shortcuts":     self.win._on_show_shortcuts,
+            "search":        self.win._on_focus_search,
+            "quit":          lambda *_: self.quit(),
             "about":         self._on_about,
         }
         for name, cb in actions.items():
@@ -51,13 +63,25 @@ class pachubApp(Adw.Application):
             act.connect("activate", cb)
             self.add_action(act)
 
+        accels = {
+            "app.search":        ["<Ctrl>f"],
+            "app.sync":          ["F5"],
+            "app.refresh":       ["<Ctrl>r"],
+            "app.check_updates": ["<Ctrl>u"],
+            "app.preferences":   ["<Ctrl>comma"],
+            "app.shortcuts":     ["<Ctrl>question"],
+            "app.quit":          ["<Ctrl>q"],
+        }
+        for action, keys in accels.items():
+            self.set_accels_for_action(action, keys)
+
         self.win.present()
 
     def _on_about(self, *_):
         about = Adw.AboutDialog()
         about.set_application_name("PacHub")
         about.set_application_icon("io.github.mrks1469.pachub")
-        about.set_version("1.0.0")
+        about.set_version("3.0.0")
         about.set_developer_name("Manpreet Singh")
         about.set_license_type(Gtk.License.GPL_2_0)
         about.set_website("https://github.com/mrks1469/PacHub")

@@ -11,6 +11,7 @@ All modal tool dialogs:
 import os
 import pty
 import re as _re
+import shlex
 import select
 import fcntl
 import termios
@@ -22,7 +23,9 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Pango
 
-from backend import run_command, get_orphans, get_system_info
+from backend import (run_command, get_orphans, get_system_info,
+                     get_pacman_history, get_cached_versions,
+                     get_pkgbuild, get_pacnew_files, get_file_diff)
 
 
 # ─── Terminal dialog ──────────────────────────────────────────────────────────
@@ -662,7 +665,7 @@ def show_orphan_finder(parent, run_terminal_fn):
             name = o["name"]
             rm_btn.connect("clicked", lambda *_, n=name: (
                 dialog.close(),
-                run_terminal_fn(f"sudo -S pacman -R --noconfirm {n}", f"Remove {n}")
+                run_terminal_fn(f"sudo -S pacman -R --noconfirm {shlex.quote(n)}", f"Remove {n}")
             ))
             row.add_suffix(rm_btn)
             listbox.append(row)
@@ -673,7 +676,7 @@ def show_orphan_finder(parent, run_terminal_fn):
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_box.set_halign(Gtk.Align.CENTER)
         btn_box.set_margin_top(12); btn_box.set_margin_bottom(16)
-        names = " ".join(o["name"] for o in orphans)
+        names = " ".join(shlex.quote(o["name"]) for o in orphans)
         remove_all_btn = Gtk.Button(label=f"Remove All {len(orphans)} Orphans")
         remove_all_btn.add_css_class("destructive-action")
         remove_all_btn.connect("clicked", lambda *_: (
@@ -775,3 +778,543 @@ def show_sysinfo_dialog(parent):
         GLib.idle_add(populate, info)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+# ─── Package history (pacman log) ─────────────────────────────────────────────
+
+_HISTORY_ICONS = {
+    "installed":   ("package-x-generic-symbolic",        "status-installed"),
+    "removed":     ("user-trash-symbolic",               "status-foreign"),
+    "upgraded":    ("software-update-available-symbolic", "status-update"),
+    "downgraded":  ("go-down-symbolic",                  "status-update"),
+    "reinstalled": ("view-refresh-symbolic",             None),
+}
+
+
+def show_history_dialog(parent):
+    dialog = Adw.Dialog()
+    dialog.set_title("Package History")
+    dialog.set_content_width(640)
+    dialog.set_content_height(560)
+
+    tv  = Adw.ToolbarView()
+    hdr = Adw.HeaderBar()
+    hdr.set_show_end_title_buttons(False)
+    close_btn = Gtk.Button(label="Close")
+    close_btn.add_css_class("flat")
+    close_btn.connect("clicked", lambda *_: dialog.close())
+    hdr.pack_start(close_btn)
+    tv.add_top_bar(hdr)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+    search = Gtk.SearchEntry()
+    search.set_placeholder_text("Filter by package name…")
+    search.set_margin_start(12); search.set_margin_end(12)
+    search.set_margin_top(10);   search.set_margin_bottom(6)
+    outer.append(search)
+
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_vexpand(True)
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scroll.set_margin_start(12); scroll.set_margin_end(12); scroll.set_margin_bottom(12)
+    listbox = Gtk.ListBox()
+    listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+    listbox.add_css_class("boxed-list")
+    scroll.set_child(listbox)
+    outer.append(scroll)
+
+    tv.set_content(outer)
+    dialog.set_child(tv)
+    dialog.present(parent)
+
+    def render(entries):
+        while listbox.get_first_child():
+            listbox.remove(listbox.get_first_child())
+        q = search.get_text().strip().lower()
+        shown = 0
+        for e in entries:
+            if q and q not in e["name"].lower():
+                continue
+            row = Adw.ActionRow()
+            row.set_title(e["name"])
+            row.set_subtitle(f"{e['action']} · {e['version']} · {e['time']}")
+            row.set_subtitle_selectable(True)
+            icon_name, css = _HISTORY_ICONS.get(e["action"], ("package-x-generic-symbolic", None))
+            icon = Gtk.Image.new_from_icon_name(icon_name)
+            icon.add_css_class("dim-label")
+            row.add_prefix(icon)
+            badge = Gtk.Label(label=e["action"].upper())
+            badge.add_css_class("row-status-pill")
+            if css:
+                badge.add_css_class(css)
+            badge.set_valign(Gtk.Align.CENTER)
+            row.add_suffix(badge)
+            listbox.append(row)
+            shown += 1
+        if shown == 0:
+            empty = Adw.ActionRow()
+            empty.set_title("No matching entries")
+            listbox.append(empty)
+
+    def worker():
+        entries = get_pacman_history()
+        def show():
+            render(entries)
+            search.connect("search-changed", lambda *_: render(entries))
+            return False
+        GLib.idle_add(show)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ─── Downgrade from cache ─────────────────────────────────────────────────────
+
+def show_downgrade_dialog(parent, pkg_name, run_terminal_fn):
+    dialog = Adw.Dialog()
+    dialog.set_title(f"Downgrade {pkg_name}")
+    dialog.set_content_width(560)
+    dialog.set_content_height(420)
+
+    tv  = Adw.ToolbarView()
+    hdr = Adw.HeaderBar()
+    hdr.set_show_end_title_buttons(False)
+    close_btn = Gtk.Button(label="Close")
+    close_btn.add_css_class("flat")
+    close_btn.connect("clicked", lambda *_: dialog.close())
+    hdr.pack_start(close_btn)
+    tv.add_top_bar(hdr)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    versions = get_cached_versions(pkg_name)
+
+    if not versions:
+        status = Adw.StatusPage()
+        status.set_icon_name("package-x-generic-symbolic")
+        status.set_title("No Cached Versions")
+        status.set_description(
+            f"No package files for {pkg_name} were found in /var/cache/pacman/pkg.\n"
+            "Older versions are only available while they remain in the cache.")
+        status.set_vexpand(True)
+        outer.append(status)
+    else:
+        info_bar = Gtk.Label(
+            label=f"{len(versions)} cached version(s) — pick one to install with pacman -U")
+        info_bar.add_css_class("caption"); info_bar.set_wrap(True)
+        info_bar.set_halign(Gtk.Align.START)
+        info_bar.set_margin_start(16); info_bar.set_margin_end(16)
+        info_bar.set_margin_top(12);   info_bar.set_margin_bottom(8)
+        outer.append(info_bar)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_margin_start(12); scroll.set_margin_end(12); scroll.set_margin_bottom(12)
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+
+        for version, filepath in versions:
+            row = Adw.ActionRow()
+            row.set_title(version)
+            row.set_subtitle(filepath)
+            row.set_subtitle_selectable(True)
+            btn = Gtk.Button(label="Install")
+            btn.add_css_class("suggested-action"); btn.add_css_class("flat")
+            btn.set_valign(Gtk.Align.CENTER)
+            btn.connect("clicked", lambda *_, fp=filepath, v=version: (
+                dialog.close(),
+                run_terminal_fn(f"sudo -S pacman -U --noconfirm {shlex.quote(fp)}",
+                                f"Downgrade {pkg_name} to {v}")
+            ))
+            row.add_suffix(btn)
+            listbox.append(row)
+
+        scroll.set_child(listbox)
+        outer.append(scroll)
+
+    tv.set_content(outer)
+    dialog.set_child(tv)
+    dialog.present(parent)
+
+
+# ─── PKGBUILD viewer (AUR) ────────────────────────────────────────────────────
+
+def show_pkgbuild_dialog(parent, pkg_name, on_install):
+    dialog = Adw.Dialog()
+    dialog.set_title(f"PKGBUILD — {pkg_name}")
+    dialog.set_content_width(760)
+    dialog.set_content_height(560)
+
+    tv  = Adw.ToolbarView()
+    hdr = Adw.HeaderBar()
+    hdr.set_show_end_title_buttons(False)
+    close_btn = Gtk.Button(label="Close")
+    close_btn.add_css_class("flat")
+    close_btn.connect("clicked", lambda *_: dialog.close())
+    hdr.pack_start(close_btn)
+    install_btn = Gtk.Button(label="Install")
+    install_btn.add_css_class("suggested-action")
+    install_btn.connect("clicked", lambda *_: (dialog.close(), on_install()))
+    hdr.pack_end(install_btn)
+    tv.add_top_bar(hdr)
+
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_vexpand(True)
+    label = Gtk.Label(label="Loading PKGBUILD…")
+    label.set_selectable(True); label.set_wrap(True)
+    label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    label.add_css_class("monospace"); label.add_css_class("caption")
+    label.set_xalign(0); label.set_yalign(0)
+    label.set_margin_start(12); label.set_margin_end(12)
+    label.set_margin_top(8);    label.set_margin_bottom(8)
+    scroll.set_child(label)
+    tv.set_content(scroll)
+    dialog.set_child(tv)
+    dialog.present(parent)
+
+    def worker():
+        text = get_pkgbuild(pkg_name)
+        GLib.idle_add(label.set_label, text)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ─── .pacnew / .pacsave manager ───────────────────────────────────────────────
+
+def show_pacdiff_dialog(parent, run_terminal_fn):
+    dialog = Adw.Dialog()
+    dialog.set_title("Config Files (.pacnew / .pacsave)")
+    dialog.set_content_width(720)
+    dialog.set_content_height(560)
+
+    tv  = Adw.ToolbarView()
+    hdr = Adw.HeaderBar()
+    hdr.set_show_end_title_buttons(False)
+    close_btn = Gtk.Button(label="Close")
+    close_btn.add_css_class("flat")
+    close_btn.connect("clicked", lambda *_: dialog.close())
+    hdr.pack_start(close_btn)
+    tv.add_top_bar(hdr)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    loading.set_halign(Gtk.Align.CENTER); loading.set_valign(Gtk.Align.CENTER)
+    loading.set_vexpand(True)
+    sp = Gtk.Spinner(); sp.start(); sp.set_size_request(32, 32)
+    loading.append(sp)
+    loading.append(Gtk.Label(label="Scanning for .pacnew/.pacsave files…"))
+    outer.append(loading)
+
+    tv.set_content(outer)
+    dialog.set_child(tv)
+    dialog.present(parent)
+
+    def render(files):
+        outer.remove(loading)
+        if not files:
+            status = Adw.StatusPage()
+            status.set_icon_name("emblem-ok-symbolic")
+            status.set_title("Nothing to Merge")
+            status.set_description("No .pacnew or .pacsave files were found.")
+            status.set_vexpand(True)
+            outer.append(status)
+            return
+
+        info = Gtk.Label(label=(
+            f"{len(files)} file(s) left behind by package updates. Review the diff, "
+            "then keep the new version or discard it."))
+        info.add_css_class("caption"); info.set_wrap(True); info.set_halign(Gtk.Align.START)
+        info.set_margin_start(16); info.set_margin_end(16)
+        info.set_margin_top(12);   info.set_margin_bottom(8)
+        outer.append(info)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_margin_start(12); scroll.set_margin_end(12); scroll.set_margin_bottom(12)
+        group = Adw.PreferencesGroup()
+
+        for fdict in files:
+            new, orig, kind = fdict["new"], fdict["orig"], fdict["kind"]
+            exp = Adw.ExpanderRow()
+            exp.set_title(orig)
+            exp.set_subtitle(f"{kind} · {new}")
+
+            diff_scroll = Gtk.ScrolledWindow()
+            diff_scroll.set_min_content_height(160); diff_scroll.set_max_content_height(300)
+            diff_lbl = Gtk.Label(label="Loading diff…")
+            diff_lbl.set_selectable(True); diff_lbl.set_wrap(True)
+            diff_lbl.set_wrap_mode(Pango.WrapMode.CHAR)
+            diff_lbl.add_css_class("monospace"); diff_lbl.add_css_class("caption")
+            diff_lbl.set_xalign(0); diff_lbl.set_yalign(0)
+            diff_lbl.set_margin_start(12); diff_lbl.set_margin_end(12)
+            diff_lbl.set_margin_top(6);    diff_lbl.set_margin_bottom(6)
+            diff_scroll.set_child(diff_lbl)
+            diff_row = Gtk.ListBoxRow(); diff_row.set_activatable(False)
+            diff_row.set_child(diff_scroll)
+            exp.add_row(diff_row)
+
+            btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            btn_row.set_halign(Gtk.Align.END)
+            btn_row.set_margin_start(12); btn_row.set_margin_end(12)
+            btn_row.set_margin_top(6);    btn_row.set_margin_bottom(8)
+            apply_btn = Gtk.Button(label="Use New (overwrite)")
+            apply_btn.add_css_class("suggested-action")
+            apply_btn.connect("clicked", lambda *_, n=new, o=orig: (
+                dialog.close(),
+                run_terminal_fn(f"sudo -S mv {shlex.quote(n)} {shlex.quote(o)}",
+                                f"Apply {n}")))
+            discard_btn = Gtk.Button(label="Discard")
+            discard_btn.add_css_class("destructive-action"); discard_btn.add_css_class("flat")
+            discard_btn.connect("clicked", lambda *_, n=new: (
+                dialog.close(),
+                run_terminal_fn(f"sudo -S rm {shlex.quote(n)}", f"Remove {n}")))
+            btn_row.append(discard_btn)
+            btn_row.append(apply_btn)
+            wrap_row = Gtk.ListBoxRow(); wrap_row.set_activatable(False)
+            wrap_row.set_child(btn_row)
+            exp.add_row(wrap_row)
+
+            group.add(exp)
+
+            def load_diff(lbl=diff_lbl, o=orig, n=new):
+                text = get_file_diff(o, n)
+                GLib.idle_add(lbl.set_label, text)
+            threading.Thread(target=load_diff, daemon=True).start()
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(group)
+        scroll.set_child(box)
+        outer.append(scroll)
+
+    def worker():
+        files = get_pacnew_files()
+        GLib.idle_add(render, files)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ─── Preferences ──────────────────────────────────────────────────────────────
+
+def show_preferences(parent, on_changed):
+    from backend import (load_settings, save_settings, is_update_timer_enabled,
+                         enable_update_timer, disable_update_timer)
+    s = load_settings()
+
+    dlg = Adw.PreferencesDialog()
+    dlg.set_title("Preferences")
+    page = Adw.PreferencesPage()
+    page.set_title("General")
+    page.set_icon_name("preferences-system-symbolic")
+
+    # AUR
+    aur_group = Adw.PreferencesGroup()
+    aur_group.set_title("AUR")
+
+    helper_opts = ["auto", "yay", "paru", "pikaur", "none"]
+    helper_row = Adw.ComboRow()
+    helper_row.set_title("AUR Helper")
+    helper_row.set_subtitle("Used for AUR installs, updates and PKGBUILDs")
+    helper_row.set_model(Gtk.StringList.new(
+        ["Auto-detect", "yay", "paru", "pikaur", "None (pacman only)"]))
+    cur = s.get("aur_helper", "auto")
+    helper_row.set_selected(helper_opts.index(cur) if cur in helper_opts else 0)
+    helper_row.connect("notify::selected", lambda r, _: (
+        save_settings({"aur_helper": helper_opts[r.get_selected()]}), on_changed()))
+    aur_group.add(helper_row)
+
+    inc_row = Adw.SwitchRow()
+    inc_row.set_title("Include AUR in update checks")
+    inc_row.set_active(s.get("include_aur_updates", True))
+    inc_row.connect("notify::active", lambda r, _: (
+        save_settings({"include_aur_updates": r.get_active()}), on_changed()))
+    aur_group.add(inc_row)
+    page.add(aur_group)
+
+    # Behaviour
+    beh = Adw.PreferencesGroup()
+    beh.set_title("Behaviour")
+
+    def _switch(title, subtitle, key):
+        row = Adw.SwitchRow()
+        row.set_title(title)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.set_active(s.get(key, True))
+        row.connect("notify::active", lambda r, _: save_settings({key: r.get_active()}))
+        beh.add(row)
+
+    _switch("Confirm before removing packages", None, "confirm_remove")
+    _switch("Check for updates on startup", None, "check_updates_on_start")
+    _switch("Notify when updates are available", None, "notify_updates")
+    _switch("Show Arch news before upgrades",
+            "Warns about manual interventions before a system upgrade",
+            "show_news_before_upgrade")
+    page.add(beh)
+
+    # Background service (systemd --user timer)
+    svc = Adw.PreferencesGroup()
+    svc.set_title("Background Service")
+    svc.set_description("Check for updates and notify even when PacHub is closed, "
+                        "via a systemd user timer")
+
+    interval_opts = ["hourly", "6h", "daily"]
+    interval_row = Adw.ComboRow()
+    interval_row.set_title("Check interval")
+    interval_row.set_model(Gtk.StringList.new(["Hourly", "Every 6 hours", "Daily"]))
+    cur_int = s.get("bg_check_interval", "daily")
+    interval_row.set_selected(interval_opts.index(cur_int) if cur_int in interval_opts else 2)
+
+    bg_row = Adw.SwitchRow()
+    bg_row.set_title("Run background update checks")
+    bg_row.set_active(is_update_timer_enabled())
+
+    def _apply_timer():
+        if bg_row.get_active():
+            enable_update_timer(interval_opts[interval_row.get_selected()])
+        else:
+            disable_update_timer()
+
+    bg_row.connect("notify::active", lambda r, _: _apply_timer())
+
+    def _on_interval(r, _):
+        save_settings({"bg_check_interval": interval_opts[r.get_selected()]})
+        if bg_row.get_active():        # re-arm with the new interval
+            enable_update_timer(interval_opts[r.get_selected()])
+
+    interval_row.connect("notify::selected", _on_interval)
+    svc.add(bg_row)
+    svc.add(interval_row)
+    page.add(svc)
+
+    dlg.add(page)
+    dlg.present(parent)
+
+
+# ─── Arch news (pre-upgrade) ──────────────────────────────────────────────────
+
+def show_news_dialog(parent, on_proceed):
+    dialog = Adw.Dialog()
+    dialog.set_title("Arch Linux News")
+    dialog.set_content_width(640)
+    dialog.set_content_height(520)
+
+    tv  = Adw.ToolbarView()
+    hdr = Adw.HeaderBar()
+    hdr.set_show_end_title_buttons(False)
+    cancel_btn = Gtk.Button(label="Cancel")
+    cancel_btn.add_css_class("flat")
+    cancel_btn.connect("clicked", lambda *_: dialog.close())
+    hdr.pack_start(cancel_btn)
+    proceed_btn = Gtk.Button(label="Upgrade Now")
+    proceed_btn.add_css_class("suggested-action")
+    proceed_btn.connect("clicked", lambda *_: (dialog.close(), on_proceed()))
+    hdr.pack_end(proceed_btn)
+    tv.add_top_bar(hdr)
+
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    loading.set_halign(Gtk.Align.CENTER); loading.set_valign(Gtk.Align.CENTER)
+    loading.set_vexpand(True)
+    sp = Gtk.Spinner(); sp.start(); sp.set_size_request(32, 32)
+    loading.append(sp)
+    loading.append(Gtk.Label(label="Fetching latest news…"))
+    outer.append(loading)
+
+    tv.set_content(outer)
+    dialog.set_child(tv)
+    dialog.present(parent)
+
+    def render(items):
+        outer.remove(loading)
+        if items is None:
+            status = Adw.StatusPage()
+            status.set_icon_name("network-offline-symbolic")
+            status.set_title("Could Not Fetch News")
+            status.set_description("You appear to be offline. You can still proceed "
+                                   "with the upgrade.")
+            status.set_vexpand(True)
+            outer.append(status)
+            return
+        if not items:
+            status = Adw.StatusPage()
+            status.set_icon_name("emblem-ok-symbolic")
+            status.set_title("No Recent News")
+            status.set_vexpand(True)
+            outer.append(status)
+            return
+
+        hint = Gtk.Label(label="Review recent announcements before upgrading:")
+        hint.add_css_class("caption"); hint.set_halign(Gtk.Align.START)
+        hint.set_margin_start(16); hint.set_margin_end(16)
+        hint.set_margin_top(12);   hint.set_margin_bottom(8)
+        outer.append(hint)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_margin_start(12); scroll.set_margin_end(12); scroll.set_margin_bottom(12)
+        group = Adw.PreferencesGroup()
+        for it in items:
+            row = Adw.ActionRow()
+            row.set_title(GLib.markup_escape_text(it["title"]))
+            row.set_subtitle(it["date"])
+            if it["link"]:
+                link = Gtk.LinkButton.new_with_label(it["link"], "Open")
+                link.set_valign(Gtk.Align.CENTER)
+                row.add_suffix(link)
+            group.add(row)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); box.append(group)
+        scroll.set_child(box)
+        outer.append(scroll)
+
+    def worker():
+        from backend import get_arch_news
+        items = get_arch_news()
+        GLib.idle_add(render, items)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ─── Keyboard shortcuts ───────────────────────────────────────────────────────
+
+_SHORTCUTS = [
+    ("Ctrl+F",      "Focus search"),
+    ("F5",          "Sync databases"),
+    ("Ctrl+R",      "Refresh package list"),
+    ("Ctrl+U",      "Check for updates"),
+    ("Ctrl+,",      "Preferences"),
+    ("Ctrl+Q",      "Quit"),
+]
+
+
+def show_shortcuts_dialog(parent):
+    dialog = Adw.Dialog()
+    dialog.set_title("Keyboard Shortcuts")
+    dialog.set_content_width(420)
+
+    tv  = Adw.ToolbarView()
+    hdr = Adw.HeaderBar()
+    hdr.set_show_end_title_buttons(False)
+    close_btn = Gtk.Button(label="Close")
+    close_btn.add_css_class("flat")
+    close_btn.connect("clicked", lambda *_: dialog.close())
+    hdr.pack_start(close_btn)
+    tv.add_top_bar(hdr)
+
+    group = Adw.PreferencesGroup()
+    group.set_margin_top(12); group.set_margin_bottom(16)
+    group.set_margin_start(12); group.set_margin_end(12)
+    for keys, desc in _SHORTCUTS:
+        row = Adw.ActionRow()
+        row.set_title(desc)
+        kbd = Gtk.Label(label=keys)
+        kbd.add_css_class("dim-label"); kbd.add_css_class("monospace")
+        kbd.set_valign(Gtk.Align.CENTER)
+        row.add_suffix(kbd)
+        group.add(row)
+
+    tv.set_content(group)
+    dialog.set_child(tv)
+    dialog.present(parent)

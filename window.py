@@ -4,6 +4,7 @@ Main application window: sidebar, search page, package list, detail panel,
 filtering, and all action handlers.
 """
 
+import shlex
 import threading
 
 import gi
@@ -14,16 +15,277 @@ from gi.repository import Gtk, Adw, GLib, Gio, Pango
 from backend import (
     get_packages, get_package_info, get_package_files,
     check_updates, search_packages_cmd, run_command,
-    invalidate_cache, invalidate_syncdb_cache,
+    invalidate_cache, invalidate_syncdb_cache, get_explicit_packages,
+    get_ignored_packages, set_package_ignored, get_setting,
 )
-from models import PackageItem, PackageRow, NavRow, REPO_BADGE_CLASS, pkg_icon
+from models import PackageItem, NavRow, REPO_BADGE_CLASS, pkg_icon, make_package_listview
 from dialogs import (
     run_terminal_dialog,
     show_repo_manager,
     show_mirror_rater,
     show_orphan_finder,
     show_sysinfo_dialog,
+    show_history_dialog,
+    show_downgrade_dialog,
+    show_pkgbuild_dialog,
+    show_pacdiff_dialog,
+    show_preferences,
+    show_news_dialog,
+    show_shortcuts_dialog,
 )
+
+
+class DetailPanel:
+    """Right-hand package detail view: hero header + Info tab + Files tab.
+
+    One instance is built for the main list page and one for the search page.
+    pachubWindow drives both through the same _show_detail / _populate_detail
+    methods, so the two views can never drift apart.
+
+    Widget references live on the instance (icon, name, status, info_rows, …);
+    `dep_callback` is set by the window to route dependency-chip clicks. The
+    Files tab is a virtualized ListView whose FilterListModel does the
+    filtering, so the search box never rebuilds rows.
+    """
+
+    INFO_KEYS = [
+        "URL", "Licenses", "Groups", "Depends On", "Optional Deps", "Required By",
+        "Conflicts With", "Provides", "Replaces",
+        "Installed Size", "Packager", "Build Date", "Install Date", "Install Reason",
+    ]
+    # Fields rendered as expandable clickable-chip flows rather than plain rows
+    DEP_KEYS = ("Depends On", "Optional Deps", "Required By")
+
+    def __init__(self, action_btn, on_install, on_remove, on_reinstall, on_downgrade):
+        self.dep_callback = None   # set by the window: takes a dependency name
+        self.info_rows = {}        # key -> ActionRow / ExpanderRow
+        self.dep_rows = {}         # key -> (ExpanderRow, FlowBox)
+        self._files_query = ""     # current Files-tab filter text (lowercased)
+        self._files_loading = False
+        self._build(action_btn, on_install, on_remove, on_reinstall, on_downgrade)
+
+    def _build(self, action_btn, on_install, on_remove, on_reinstall, on_downgrade):
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(120)
+
+        empty = Adw.StatusPage()
+        empty.set_icon_name("package-x-generic-symbolic")
+        empty.set_title("Select a Package")
+        empty.set_description("Choose a package to view its details, files, and dependencies.")
+        self.stack.add_named(empty, "empty")
+
+        detail_scroll = Gtk.ScrolledWindow()
+        detail_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        detail_box.set_margin_top(16);   detail_box.set_margin_bottom(24)
+        detail_box.set_margin_start(20); detail_box.set_margin_end(20)
+
+        # Hero
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        hero.add_css_class("pkg-hero")
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.icon = Gtk.Image()
+        self.icon.set_pixel_size(52); self.icon.set_valign(Gtk.Align.CENTER)
+        self.icon.set_from_icon_name("package-x-generic-symbolic")
+        top_row.append(self.icon)
+        title_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title_col.set_hexpand(True); title_col.set_valign(Gtk.Align.CENTER)
+        self.name = Gtk.Label(label="Package")
+        self.name.set_halign(Gtk.Align.START); self.name.add_css_class("title-2")
+        title_col.append(self.name)
+        self.desc = Gtk.Label(label="Description")
+        self.desc.set_halign(Gtk.Align.START); self.desc.add_css_class("body")
+        self.desc.add_css_class("dim-label"); self.desc.set_wrap(True)
+        self.desc.set_wrap_mode(Pango.WrapMode.WORD)
+        title_col.append(self.desc)
+        top_row.append(title_col)
+        self.status = Gtk.Label(label="INSTALLED")
+        self.status.add_css_class("status-pill"); self.status.add_css_class("status-installed")
+        self.status.set_valign(Gtk.Align.START)
+        top_row.append(self.status)
+        hero.append(top_row)
+
+        meta_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.ver_badge = Gtk.Label(label="1.0.0")
+        self.ver_badge.add_css_class("badge"); self.ver_badge.add_css_class("badge-local")
+        meta_row.append(self.ver_badge)
+        self.repo_badge = Gtk.Label(label="CORE")
+        self.repo_badge.add_css_class("badge"); self.repo_badge.add_css_class("badge-core")
+        meta_row.append(self.repo_badge)
+        self.arch_badge = Gtk.Label(label="x86_64")
+        self.arch_badge.add_css_class("badge"); self.arch_badge.add_css_class("badge-local")
+        meta_row.append(self.arch_badge)
+        hero.append(meta_row)
+
+        hero_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_install = action_btn(
+            "package-x-generic-symbolic", "Install",
+            "suggested-action", "install-btn", callback=on_install)
+        self.btn_install.set_sensitive(False)
+        self.btn_remove = action_btn(
+            "user-trash-symbolic", "Uninstall",
+            "destructive-action", "remove-btn", callback=on_remove)
+        self.btn_remove.set_sensitive(False)
+        self.btn_reinstall = action_btn(
+            "view-refresh-symbolic", "Reinstall", callback=on_reinstall)
+        self.btn_reinstall.set_sensitive(False)
+        self.btn_reinstall.add_css_class("flat")
+        self.btn_downgrade = action_btn(
+            "go-down-symbolic", "Downgrade", callback=on_downgrade)
+        self.btn_downgrade.set_sensitive(False)
+        self.btn_downgrade.add_css_class("flat")
+        hero_actions.append(self.btn_install)
+        hero_actions.append(self.btn_remove)
+        hero_actions.append(self.btn_reinstall)
+        hero_actions.append(self.btn_downgrade)
+        hero.append(hero_actions)
+        detail_box.append(hero)
+
+        # Tabs
+        self.view_stack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher()
+        switcher.set_stack(self.view_stack)
+        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        detail_box.append(switcher)
+
+        # Info tab
+        info_scroll = Gtk.ScrolledWindow()
+        info_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        info_scroll.set_min_content_height(200)
+        info_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        info_inner.set_margin_start(4); info_inner.set_margin_end(4)
+        info_group = Adw.PreferencesGroup()
+        info_group.set_title("Package Information")
+        info_inner.append(info_group)
+        for key in self.INFO_KEYS:
+            if key in self.DEP_KEYS:
+                exp_row = Adw.ExpanderRow()
+                exp_row.set_title(key); exp_row.set_subtitle("—")
+                flow = Gtk.FlowBox()
+                flow.set_selection_mode(Gtk.SelectionMode.NONE)
+                flow.set_column_spacing(6); flow.set_row_spacing(6)
+                flow.set_margin_start(12); flow.set_margin_end(12)
+                flow.set_margin_top(8); flow.set_margin_bottom(10)
+                flow_row = Gtk.ListBoxRow()
+                flow_row.set_activatable(False)
+                flow_row.set_child(flow)
+                exp_row.add_row(flow_row)
+                info_group.add(exp_row)
+                self.dep_rows[key] = (exp_row, flow)
+                self.info_rows[key] = exp_row
+            else:
+                row = Adw.ActionRow()
+                row.set_title(key); row.set_subtitle("—")
+                row.set_subtitle_selectable(True)
+                info_group.add(row)
+                self.info_rows[key] = row
+
+        raw_group = Adw.PreferencesGroup()
+        raw_group.set_title("Raw Output")
+        info_inner.append(raw_group)
+        raw_exp = Adw.ExpanderRow()
+        raw_exp.set_title("pacman -Qi output")
+        raw_exp.set_subtitle("Full package information")
+        raw_group.add(raw_exp)
+        raw_scroll = Gtk.ScrolledWindow()
+        raw_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        raw_scroll.set_min_content_height(120); raw_scroll.set_max_content_height(240)
+        self.raw_text = Gtk.Label(label="")
+        self.raw_text.set_selectable(True); self.raw_text.set_wrap(True)
+        self.raw_text.set_wrap_mode(Pango.WrapMode.CHAR)
+        self.raw_text.add_css_class("monospace"); self.raw_text.add_css_class("caption")
+        self.raw_text.set_xalign(0)
+        self.raw_text.set_margin_start(12); self.raw_text.set_margin_end(12)
+        self.raw_text.set_margin_top(8); self.raw_text.set_margin_bottom(8)
+        raw_scroll.set_child(self.raw_text)
+        raw_exp.add_row(raw_scroll)
+        info_scroll.set_child(info_inner)
+        self.view_stack.add_titled_with_icon(
+            info_scroll, "info", "Info", "dialog-information-symbolic")
+
+        # Files tab — virtualized ListView with a FilterListModel doing the
+        # filtering, so typing in the search box never rebuilds the rows.
+        files_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        files_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        files_hdr.set_margin_start(6); files_hdr.set_margin_end(6)
+        files_hdr.set_margin_top(6); files_hdr.set_margin_bottom(4)
+        self.files_search = Gtk.SearchEntry()
+        self.files_search.set_placeholder_text("Filter…")
+        self.files_search.set_hexpand(True)
+        self.files_search.connect("search-changed", self._on_files_filter_changed)
+        files_hdr.append(self.files_search)
+        self.files_count_lbl = Gtk.Label(label="")
+        self.files_count_lbl.add_css_class("caption"); self.files_count_lbl.add_css_class("dim-label")
+        self.files_count_lbl.set_halign(Gtk.Align.END)
+        files_hdr.append(self.files_count_lbl)
+        files_box.append(files_hdr)
+
+        self.files_model = Gtk.StringList()
+        self.files_filter = Gtk.CustomFilter.new(self._files_match)
+        self.files_filter_model = Gtk.FilterListModel(model=self.files_model,
+                                                      filter=self.files_filter)
+        self.files_filter_model.connect("items-changed", self._update_files_count)
+
+        files_factory = Gtk.SignalListItemFactory()
+        files_factory.connect("setup", self._files_setup)
+        files_factory.connect("bind",
+                              lambda f, li: li.get_child().set_label(li.get_item().get_string()))
+        files_scroll = Gtk.ScrolledWindow()
+        files_scroll.set_vexpand(True)
+        self.files_listview = Gtk.ListView(
+            model=Gtk.NoSelection(model=self.files_filter_model), factory=files_factory)
+        self.files_listview.add_css_class("navigation-sidebar")
+        files_scroll.set_child(self.files_listview)
+        files_box.append(files_scroll)
+        self.view_stack.add_titled_with_icon(
+            files_box, "files", "Files", "folder-symbolic")
+
+        detail_box.append(self.view_stack)
+        detail_scroll.set_child(detail_box)
+        self.stack.add_named(detail_scroll, "detail")
+        self.stack.set_visible_child_name("empty")
+
+    # ── Files tab helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _files_setup(factory, list_item):
+        lbl = Gtk.Label()
+        lbl.set_halign(Gtk.Align.START); lbl.set_selectable(True)
+        lbl.add_css_class("monospace"); lbl.add_css_class("caption")
+        lbl.set_margin_start(12); lbl.set_margin_top(4); lbl.set_margin_bottom(4)
+        list_item.set_child(lbl)
+
+    def _files_match(self, item):
+        return (not self._files_query) or (self._files_query in item.get_string().lower())
+
+    def _on_files_filter_changed(self, entry):
+        self._files_query = entry.get_text().strip().lower()
+        self.files_filter.changed(Gtk.FilterChange.DIFFERENT)
+
+    def _update_files_count(self, *args):
+        if self._files_loading:
+            return
+        total = self.files_model.get_n_items()
+        shown = self.files_filter_model.get_n_items()
+        self.files_count_lbl.set_label(
+            f"{shown} of {total} files" if self._files_query else f"{total} files")
+
+    def set_files_loading(self):
+        """Clear the Files tab and show a loading placeholder."""
+        self._files_loading = True
+        self.files_model.splice(0, self.files_model.get_n_items(), [])
+        self.files_count_lbl.set_label("Loading…")
+
+    def set_files(self, files):
+        """Populate the Files tab from raw `pacman -Ql` lines ("pkg /path")."""
+        paths = []
+        for line in files:
+            parts = line.split(None, 1)
+            paths.append(parts[1] if len(parts) == 2 else line)
+        self._files_loading = False
+        self.files_model.splice(0, self.files_model.get_n_items(), paths)
+        self._update_files_count()
 
 
 class pachubWindow(Adw.ApplicationWindow):
@@ -37,7 +299,7 @@ class pachubWindow(Adw.ApplicationWindow):
         self._current_filter   = "installed"
         self._updates          = None
         self._aur_helper_cache = None
-        self._pkg_files_all    = []
+        self._search_timer     = None   # GLib source id for debounced search
         self._alive            = True   # set False on close to stop background workers
         self.connect("close-request", self._on_close_request)
         self._build_ui()
@@ -45,6 +307,7 @@ class pachubWindow(Adw.ApplicationWindow):
 
     def _on_close_request(self, *_):
         self._alive = False
+        self._cancel_search_timer()
         return False   # allow window to close
 
     # ── Build UI ──────────────────────────────────────────────────────────────
@@ -102,9 +365,21 @@ class pachubWindow(Adw.ApplicationWindow):
         menu.append("Rate Mirrors…",        "app.rate_mirrors")
         menu.append_section(None, Gio.Menu())
         menu.append("Find Orphans",         "app.orphans")
+        menu.append("Config Files (.pacnew)…", "app.pacdiff")
+        menu.append("Package History…",     "app.history")
         menu.append("System Info",          "app.sysinfo")
         menu.append("Cache Cleaner",        "app.cache")
         menu.append_section(None, Gio.Menu())
+        menu.append("Export Package List…", "app.export_pkgs")
+        menu.append("Import Package List…", "app.import_pkgs")
+        menu.append_section(None, Gio.Menu())
+        menu.append("View PKGBUILD (AUR)…",         "app.pkgbuild")
+        menu.append("Hold / Unhold Selected",       "app.hold")
+        menu.append("Mark Selected as Explicit",    "app.mark_explicit")
+        menu.append("Mark Selected as Dependency",  "app.mark_asdeps")
+        menu.append_section(None, Gio.Menu())
+        menu.append("Preferences",          "app.preferences")
+        menu.append("Keyboard Shortcuts",   "app.shortcuts")
         menu.append("About PacHub",         "app.about")
         menu_btn.set_menu_model(menu)
         right_box.append(menu_btn)
@@ -162,6 +437,7 @@ class pachubWindow(Adw.ApplicationWindow):
         self.search_entry.set_placeholder_text("Search packages, e.g. firefox, vlc, git…")
         self.search_entry.set_hexpand(True)
         self.search_entry.add_css_class("search-page-entry")
+        self.search_entry.connect("changed", self._on_search_changed)
         self.search_entry.connect("activate", self._on_search_activate)
         search_row.append(self.search_entry)
 
@@ -203,7 +479,7 @@ class pachubWindow(Adw.ApplicationWindow):
         no_results.set_description("Try different keywords or check your spelling.")
         self._search_results_stack.add_named(no_results, "empty")
 
-        # Results paned — reuses the shared detail_stack built in _build_detail_panel
+        # Results paned — its own DetailPanel (self.search_panel), built below
         self._search_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self._search_paned.set_position(380)
         self._search_paned.set_shrink_start_child(False)
@@ -213,11 +489,12 @@ class pachubWindow(Adw.ApplicationWindow):
         results_scroll = Gtk.ScrolledWindow()
         results_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         results_scroll.set_vexpand(True)
-        self.search_listbox = Gtk.ListBox()
-        self.search_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.search_listbox.add_css_class("navigation-sidebar")
-        self.search_listbox.connect("row-activated", self._on_search_pkg_selected)
-        results_scroll.set_child(self.search_listbox)
+        self.search_listview, self.search_store, self.search_selection = \
+            make_package_listview(self._on_search_activated)
+        # Keep keyboard focus in the search entry as results stream in, so
+        # search-as-you-type can't be interrupted by the list grabbing focus.
+        self.search_listview.set_can_focus(False)
+        results_scroll.set_child(self.search_listview)
         results_panel.append(results_scroll)
 
         results_action = Gtk.ActionBar()
@@ -259,173 +536,11 @@ class pachubWindow(Adw.ApplicationWindow):
     # ── Search detail panel (independent copy for search paned) ──────────────
 
     def _build_search_detail_panel(self):
-        self.search_detail_stack = Gtk.Stack()
-        self.search_detail_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        self.search_detail_stack.set_transition_duration(120)
-
-        empty = Adw.StatusPage()
-        empty.set_icon_name("package-x-generic-symbolic")
-        empty.set_title("Select a Package")
-        empty.set_description("Choose a search result to view its details.")
-        self.search_detail_stack.add_named(empty, "empty")
-
-        detail_scroll = Gtk.ScrolledWindow()
-        detail_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        detail_box.set_margin_top(16); detail_box.set_margin_bottom(24)
-        detail_box.set_margin_start(20); detail_box.set_margin_end(20)
-
-        # Hero
-        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        hero.add_css_class("pkg-hero")
-        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        self.sd_icon = Gtk.Image()
-        self.sd_icon.set_pixel_size(52); self.sd_icon.set_valign(Gtk.Align.CENTER)
-        self.sd_icon.set_from_icon_name("package-x-generic-symbolic")
-        top_row.append(self.sd_icon)
-        title_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        title_col.set_hexpand(True); title_col.set_valign(Gtk.Align.CENTER)
-        self.sd_name = Gtk.Label(label="Package")
-        self.sd_name.set_halign(Gtk.Align.START); self.sd_name.add_css_class("title-2")
-        title_col.append(self.sd_name)
-        self.sd_desc = Gtk.Label(label="Description")
-        self.sd_desc.set_halign(Gtk.Align.START); self.sd_desc.add_css_class("body")
-        self.sd_desc.add_css_class("dim-label"); self.sd_desc.set_wrap(True)
-        self.sd_desc.set_wrap_mode(Pango.WrapMode.WORD)
-        title_col.append(self.sd_desc)
-        top_row.append(title_col)
-        self.sd_status = Gtk.Label(label="AVAILABLE")
-        self.sd_status.add_css_class("status-pill"); self.sd_status.add_css_class("status-available")
-        self.sd_status.set_valign(Gtk.Align.START)
-        top_row.append(self.sd_status)
-        hero.append(top_row)
-
-        meta_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.sd_ver_badge = Gtk.Label(label="1.0.0")
-        self.sd_ver_badge.add_css_class("badge"); self.sd_ver_badge.add_css_class("badge-local")
-        meta_row.append(self.sd_ver_badge)
-        self.sd_repo_badge = Gtk.Label(label="REPO")
-        self.sd_repo_badge.add_css_class("badge"); self.sd_repo_badge.add_css_class("badge-core")
-        meta_row.append(self.sd_repo_badge)
-        self.sd_arch_badge = Gtk.Label(label="x86_64")
-        self.sd_arch_badge.add_css_class("badge"); self.sd_arch_badge.add_css_class("badge-local")
-        meta_row.append(self.sd_arch_badge)
-        hero.append(meta_row)
-
-        hero_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.sd_btn_install = self._action_btn(
-            "package-x-generic-symbolic", "Install",
-            "suggested-action", "install-btn", callback=self._on_install)
-        self.sd_btn_install.set_sensitive(False)
-        self.sd_btn_remove = self._action_btn(
-            "user-trash-symbolic", "Uninstall",
-            "destructive-action", "remove-btn", callback=self._on_remove)
-        self.sd_btn_remove.set_sensitive(False)
-        self.sd_btn_reinstall = self._action_btn(
-            "view-refresh-symbolic", "Reinstall", callback=self._on_reinstall)
-        self.sd_btn_reinstall.set_sensitive(False)
-        self.sd_btn_reinstall.add_css_class("flat")
-        hero_actions.append(self.sd_btn_install)
-        hero_actions.append(self.sd_btn_remove)
-        hero_actions.append(self.sd_btn_reinstall)
-        hero.append(hero_actions)
-        detail_box.append(hero)
-
-        # Info group
-        self.sd_view_stack = Adw.ViewStack()
-        sd_switcher = Adw.ViewSwitcher()
-        sd_switcher.set_stack(self.sd_view_stack)
-        sd_switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
-        detail_box.append(sd_switcher)
-
-        info_scroll = Gtk.ScrolledWindow()
-        info_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        info_scroll.set_min_content_height(200)
-        info_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        info_inner.set_margin_start(4); info_inner.set_margin_end(4)
-        sd_info_group = Adw.PreferencesGroup()
-        sd_info_group.set_title("Package Information")
-        info_inner.append(sd_info_group)
-        self.sd_info_rows = {}
-        self.sd_dep_rows = {}
-        for key in ["URL", "Licenses", "Groups", "Depends On", "Optional Deps",
-                    "Conflicts With", "Provides", "Replaces",
-                    "Installed Size", "Packager", "Build Date", "Install Date", "Install Reason"]:
-            if key in ("Depends On", "Optional Deps"):
-                exp_row = Adw.ExpanderRow()
-                exp_row.set_title(key); exp_row.set_subtitle("—")
-                flow = Gtk.FlowBox()
-                flow.set_selection_mode(Gtk.SelectionMode.NONE)
-                flow.set_column_spacing(6); flow.set_row_spacing(6)
-                flow.set_margin_start(12); flow.set_margin_end(12)
-                flow.set_margin_top(8); flow.set_margin_bottom(10)
-                flow_row = Gtk.ListBoxRow()
-                flow_row.set_activatable(False)
-                flow_row.set_child(flow)
-                exp_row.add_row(flow_row)
-                sd_info_group.add(exp_row)
-                self.sd_dep_rows[key] = (exp_row, flow)
-                self.sd_info_rows[key] = exp_row
-            else:
-                row = Adw.ActionRow()
-                row.set_title(key); row.set_subtitle("—")
-                row.set_subtitle_selectable(True)
-                sd_info_group.add(row)
-                self.sd_info_rows[key] = row
-
-        raw_group = Adw.PreferencesGroup()
-        raw_group.set_title("Raw Output")
-        info_inner.append(raw_group)
-        raw_exp = Adw.ExpanderRow()
-        raw_exp.set_title("pacman -Qi output")
-        raw_exp.set_subtitle("Full package information")
-        raw_group.add(raw_exp)
-        raw_scroll = Gtk.ScrolledWindow()
-        raw_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        raw_scroll.set_min_content_height(120); raw_scroll.set_max_content_height(240)
-        self.sd_raw_text = Gtk.Label(label="")
-        self.sd_raw_text.set_selectable(True); self.sd_raw_text.set_wrap(True)
-        self.sd_raw_text.set_wrap_mode(Pango.WrapMode.CHAR)
-        self.sd_raw_text.add_css_class("monospace"); self.sd_raw_text.add_css_class("caption")
-        self.sd_raw_text.set_xalign(0)
-        self.sd_raw_text.set_margin_start(12); self.sd_raw_text.set_margin_end(12)
-        self.sd_raw_text.set_margin_top(8); self.sd_raw_text.set_margin_bottom(8)
-        raw_scroll.set_child(self.sd_raw_text)
-        raw_exp.add_row(raw_scroll)
-        info_scroll.set_child(info_inner)
-        self.sd_view_stack.add_titled_with_icon(
-            info_scroll, "info", "Info", "dialog-information-symbolic")
-
-        # Files tab
-        sd_files_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        sd_files_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        sd_files_hdr.set_margin_start(6); sd_files_hdr.set_margin_end(6)
-        sd_files_hdr.set_margin_top(6); sd_files_hdr.set_margin_bottom(4)
-        self.sd_files_search = Gtk.SearchEntry()
-        self.sd_files_search.set_placeholder_text("Filter…")
-        self.sd_files_search.set_hexpand(True)
-        self.sd_files_search.connect("search-changed", self._on_sd_files_search)
-        sd_files_hdr.append(self.sd_files_search)
-        self.sd_files_count_lbl = Gtk.Label(label="")
-        self.sd_files_count_lbl.add_css_class("caption"); self.sd_files_count_lbl.add_css_class("dim-label")
-        self.sd_files_count_lbl.set_halign(Gtk.Align.END)
-        sd_files_hdr.append(self.sd_files_count_lbl)
-        sd_files_box.append(sd_files_hdr)
-        sd_files_scroll = Gtk.ScrolledWindow()
-        sd_files_scroll.set_vexpand(True)
-        self.sd_files_listbox = Gtk.ListBox()
-        self.sd_files_listbox.add_css_class("navigation-sidebar")
-        self.sd_files_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        sd_files_scroll.set_child(self.sd_files_listbox)
-        sd_files_box.append(sd_files_scroll)
-        self.sd_view_stack.add_titled_with_icon(
-            sd_files_box, "files", "Files", "folder-symbolic")
-
-        detail_box.append(self.sd_view_stack)
-        detail_scroll.set_child(detail_box)
-        self.search_detail_stack.add_named(detail_scroll, "detail")
-        self.search_detail_stack.set_visible_child_name("empty")
-        return self.search_detail_stack
+        self.search_panel = DetailPanel(
+            self._action_btn, self._on_install, self._on_remove,
+            self._on_reinstall, self._on_downgrade)
+        self.search_panel.dep_callback = self._search_dep
+        return self.search_panel.stack
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
 
@@ -552,11 +667,9 @@ class pachubWindow(Adw.ApplicationWindow):
         pkg_scroll = Gtk.ScrolledWindow()
         pkg_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         pkg_scroll.set_vexpand(True)
-        self.pkg_listbox = Gtk.ListBox()
-        self.pkg_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.pkg_listbox.add_css_class("navigation-sidebar")
-        self.pkg_listbox.connect("row-activated", self._on_pkg_selected)
-        pkg_scroll.set_child(self.pkg_listbox)
+        self.pkg_listview, self.pkg_store, self.pkg_selection = \
+            make_package_listview(self._on_pkg_activated)
+        pkg_scroll.set_child(self.pkg_listview)
 
         spinner_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         spinner_box.set_halign(Gtk.Align.CENTER); spinner_box.set_valign(Gtk.Align.CENTER)
@@ -617,6 +730,17 @@ class pachubWindow(Adw.ApplicationWindow):
         panel.append(action_bar)
         return panel
 
+    @staticmethod
+    def _set_btn_label(btn, text):
+        # Buttons built by _action_btn wrap an icon + label in a Box; find the
+        # Gtk.Label child and update its text.
+        child = btn.get_child().get_first_child()
+        while child:
+            if isinstance(child, Gtk.Label):
+                child.set_label(text)
+                return
+            child = child.get_next_sibling()
+
     def _action_btn(self, icon, label, *css_classes, callback=None):
         btn = Gtk.Button()
         for cls in css_classes:
@@ -633,173 +757,11 @@ class pachubWindow(Adw.ApplicationWindow):
     # ── Detail panel ──────────────────────────────────────────────────────────
 
     def _build_detail_panel(self):
-        self.detail_stack = Gtk.Stack()
-        self.detail_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        self.detail_stack.set_transition_duration(120)
-
-        empty = Adw.StatusPage()
-        empty.set_icon_name("package-x-generic-symbolic")
-        empty.set_title("Select a Package")
-        empty.set_description("Choose a package to view its details, files, and dependencies.")
-        self.detail_stack.add_named(empty, "empty")
-
-        detail_scroll = Gtk.ScrolledWindow()
-        detail_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        detail_box.set_margin_top(16);   detail_box.set_margin_bottom(24)
-        detail_box.set_margin_start(20); detail_box.set_margin_end(20)
-
-        # Hero
-        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        hero.add_css_class("pkg-hero")
-        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        self.detail_icon = Gtk.Image()
-        self.detail_icon.set_pixel_size(52); self.detail_icon.set_valign(Gtk.Align.CENTER)
-        self.detail_icon.set_from_icon_name("package-x-generic-symbolic")
-        top_row.append(self.detail_icon)
-        title_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        title_col.set_hexpand(True); title_col.set_valign(Gtk.Align.CENTER)
-        self.detail_name = Gtk.Label(label="Package")
-        self.detail_name.set_halign(Gtk.Align.START); self.detail_name.add_css_class("title-2")
-        title_col.append(self.detail_name)
-        self.detail_desc = Gtk.Label(label="Description")
-        self.detail_desc.set_halign(Gtk.Align.START); self.detail_desc.add_css_class("body")
-        self.detail_desc.add_css_class("dim-label"); self.detail_desc.set_wrap(True)
-        self.detail_desc.set_wrap_mode(Pango.WrapMode.WORD)
-        title_col.append(self.detail_desc)
-        top_row.append(title_col)
-        self.detail_status = Gtk.Label(label="INSTALLED")
-        self.detail_status.add_css_class("status-pill"); self.detail_status.add_css_class("status-installed")
-        self.detail_status.set_valign(Gtk.Align.START)
-        top_row.append(self.detail_status)
-        hero.append(top_row)
-
-        meta_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.detail_ver_badge = Gtk.Label(label="1.0.0")
-        self.detail_ver_badge.add_css_class("badge"); self.detail_ver_badge.add_css_class("badge-local")
-        meta_row.append(self.detail_ver_badge)
-        self.detail_repo_badge = Gtk.Label(label="CORE")
-        self.detail_repo_badge.add_css_class("badge"); self.detail_repo_badge.add_css_class("badge-core")
-        meta_row.append(self.detail_repo_badge)
-        self.detail_arch_badge = Gtk.Label(label="x86_64")
-        self.detail_arch_badge.add_css_class("badge"); self.detail_arch_badge.add_css_class("badge-local")
-        meta_row.append(self.detail_arch_badge)
-        hero.append(meta_row)
-
-        hero_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.detail_btn_install = self._action_btn(
-            "package-x-generic-symbolic", "Install",
-            "suggested-action", "install-btn", callback=self._on_install)
-        self.detail_btn_install.set_sensitive(False)
-        self.detail_btn_remove = self._action_btn(
-            "user-trash-symbolic", "Uninstall",
-            "destructive-action", "remove-btn", callback=self._on_remove)
-        self.detail_btn_remove.set_sensitive(False)
-        self.detail_btn_reinstall = self._action_btn(
-            "view-refresh-symbolic", "Reinstall", callback=self._on_reinstall)
-        self.detail_btn_reinstall.set_sensitive(False)
-        self.detail_btn_reinstall.add_css_class("flat")
-        hero_actions.append(self.detail_btn_install)
-        hero_actions.append(self.detail_btn_remove)
-        hero_actions.append(self.detail_btn_reinstall)
-        hero.append(hero_actions)
-        detail_box.append(hero)
-
-        # Tabs
-        self.detail_view_stack = Adw.ViewStack()
-        switcher = Adw.ViewSwitcher()
-        switcher.set_stack(self.detail_view_stack)
-        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
-        detail_box.append(switcher)
-
-        # Info tab
-        info_scroll = Gtk.ScrolledWindow()
-        info_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        info_scroll.set_min_content_height(200)
-        info_box_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        info_box_inner.set_margin_start(4); info_box_inner.set_margin_end(4)
-        info_group = Adw.PreferencesGroup()
-        info_group.set_title("Package Information")
-        info_box_inner.append(info_group)
-        self.info_rows = {}
-        self._dep_rows = {}
-        for key in ["URL", "Licenses", "Groups", "Depends On", "Optional Deps",
-                    "Conflicts With", "Provides", "Replaces",
-                    "Installed Size", "Packager", "Build Date", "Install Date", "Install Reason"]:
-            if key in ("Depends On", "Optional Deps"):
-                exp_row = Adw.ExpanderRow()
-                exp_row.set_title(key); exp_row.set_subtitle("—")
-                flow = Gtk.FlowBox()
-                flow.set_selection_mode(Gtk.SelectionMode.NONE)
-                flow.set_column_spacing(6); flow.set_row_spacing(6)
-                flow.set_margin_start(12); flow.set_margin_end(12)
-                flow.set_margin_top(8); flow.set_margin_bottom(10)
-                flow_row = Gtk.ListBoxRow()
-                flow_row.set_activatable(False)
-                flow_row.set_child(flow)
-                exp_row.add_row(flow_row)
-                info_group.add(exp_row)
-                self._dep_rows[key] = (exp_row, flow)
-                self.info_rows[key] = exp_row
-            else:
-                row = Adw.ActionRow()
-                row.set_title(key); row.set_subtitle("—")
-                row.set_subtitle_selectable(True)
-                info_group.add(row)
-                self.info_rows[key] = row
-
-        raw_group = Adw.PreferencesGroup()
-        raw_group.set_title("Raw Output")
-        info_box_inner.append(raw_group)
-        raw_exp = Adw.ExpanderRow()
-        raw_exp.set_title("pacman -Qi output")
-        raw_exp.set_subtitle("Full package information")
-        raw_group.add(raw_exp)
-        raw_scroll_inner = Gtk.ScrolledWindow()
-        raw_scroll_inner.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        raw_scroll_inner.set_min_content_height(120); raw_scroll_inner.set_max_content_height(240)
-        self.raw_text = Gtk.Label(label="")
-        self.raw_text.set_selectable(True); self.raw_text.set_wrap(True)
-        self.raw_text.set_wrap_mode(Pango.WrapMode.CHAR)
-        self.raw_text.add_css_class("monospace"); self.raw_text.add_css_class("caption")
-        self.raw_text.set_xalign(0)
-        self.raw_text.set_margin_start(12); self.raw_text.set_margin_end(12)
-        self.raw_text.set_margin_top(8); self.raw_text.set_margin_bottom(8)
-        raw_scroll_inner.set_child(self.raw_text)
-        raw_exp.add_row(raw_scroll_inner)
-        info_scroll.set_child(info_box_inner)
-        self.detail_view_stack.add_titled_with_icon(
-            info_scroll, "info", "Info", "dialog-information-symbolic")
-
-        # Files tab
-        files_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        files_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        files_hdr.set_margin_start(6); files_hdr.set_margin_end(6)
-        files_hdr.set_margin_top(6); files_hdr.set_margin_bottom(4)
-        self.files_search = Gtk.SearchEntry()
-        self.files_search.set_placeholder_text("Filter…"); self.files_search.set_hexpand(True)
-        self.files_search.connect("search-changed", self._on_files_search)
-        files_hdr.append(self.files_search)
-        self.files_count_lbl = Gtk.Label(label="")
-        self.files_count_lbl.add_css_class("caption"); self.files_count_lbl.add_css_class("dim-label")
-        self.files_count_lbl.set_halign(Gtk.Align.END)
-        files_hdr.append(self.files_count_lbl)
-        files_box.append(files_hdr)
-        files_scroll = Gtk.ScrolledWindow()
-        files_scroll.set_vexpand(True)
-        self.files_listbox = Gtk.ListBox()
-        self.files_listbox.add_css_class("navigation-sidebar")
-        self.files_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        files_scroll.set_child(self.files_listbox)
-        files_box.append(files_scroll)
-        self.detail_view_stack.add_titled_with_icon(
-            files_box, "files", "Files", "folder-symbolic")
-
-        detail_box.append(self.detail_view_stack)
-        detail_scroll.set_child(detail_box)
-        self.detail_stack.add_named(detail_scroll, "detail")
-        self.detail_stack.set_visible_child_name("empty")
-        return self.detail_stack
+        self.detail_panel = DetailPanel(
+            self._action_btn, self._on_install, self._on_remove,
+            self._on_reinstall, self._on_downgrade)
+        self.detail_panel.dep_callback = self._lookup_dep_in_list
+        return self.detail_panel.stack
 
     # ── Data loading ──────────────────────────────────────────────────────────
 
@@ -816,13 +778,19 @@ class pachubWindow(Adw.ApplicationWindow):
     def _on_packages_loaded(self, packages):
         self._all_packages = packages
         self.spinner.stop()
+        # Carry over the known update markers so a reload doesn't wipe them.
+        self._reapply_update_markers()
         self._update_sidebar_counts()
         # Only render the list if we're on a list page — skip if on Search
         if self.main_stack.get_visible_child_name() != "search":
             self._apply_filter()
         else:
             self.list_stack.set_visible_child_name("list")
-        threading.Thread(target=self._bg_check_updates, daemon=True).start()
+        # Re-verify updates: on first load when the setting allows it, and on
+        # every reload once we've checked before (e.g. after a package op, so
+        # an updated package leaves the Updates list).
+        if self._updates is not None or get_setting("check_updates_on_start"):
+            threading.Thread(target=self._bg_check_updates, daemon=True).start()
         return False
 
     def _bg_check_updates(self):
@@ -830,7 +798,17 @@ class pachubWindow(Adw.ApplicationWindow):
         if self._alive:
             GLib.idle_add(self._on_updates_loaded, updates)
 
+    def _notify_updates(self, n):
+        app = self.get_application()
+        if app is None:
+            return
+        notif = Gio.Notification.new("Updates Available")
+        notif.set_body(f"{n} package update{'s' if n != 1 else ''} can be installed.")
+        notif.set_priority(Gio.NotificationPriority.NORMAL)
+        app.send_notification("pachub-updates", notif)
+
     def _on_updates_loaded(self, updates):
+        prev_n = len(self._updates) if self._updates else 0
         self._updates = updates
         n = len(updates)
         self.stat_updates._num.set_label(str(n))
@@ -838,19 +816,31 @@ class pachubWindow(Adw.ApplicationWindow):
         if n > 0:
             self.update_banner.set_title(f"{n} update{'s' if n != 1 else ''} available")
             self.update_banner.set_revealed(True)
+            # Desktop notification when the update count first rises.
+            if n != prev_n and get_setting("notify_updates"):
+                self._notify_updates(n)
         else:
             self.update_banner.set_revealed(False)
         self.empty_updates_page.set_description(
             "No pending updates found." if n == 0 else f"{n} update(s) available.")
         self._update_action_bar_mode()
-        update_map = {u["name"]: u["new"] for u in updates}
+        self._reapply_update_markers()
+        if self.main_stack.get_visible_child_name() != "search":
+            self._apply_filter()
+        return False
+
+    def _reapply_update_markers(self):
+        """Sync the 'update' status on _all_packages with the current
+        self._updates set. Marks pending updates and clears stale ones, so a
+        fresh package reload (e.g. after installing/updating) reflects reality."""
+        update_map = {u["name"]: u["new"] for u in (self._updates or [])}
         for pkg in self._all_packages:
             if pkg["name"] in update_map:
                 pkg["status"] = "update"
                 pkg["new_version"] = update_map[pkg["name"]]
-        if self.main_stack.get_visible_child_name() != "search":
-            self._apply_filter()
-        return False
+            elif pkg.get("status") == "update":
+                pkg["status"] = "installed"
+                pkg.pop("new_version", None)
 
     def _update_sidebar_counts(self):
         total     = len(self._all_packages)
@@ -902,58 +892,69 @@ class pachubWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=do_filter, daemon=True).start()
 
+    @staticmethod
+    def _make_item(p):
+        return PackageItem(
+            p["name"], p["version"], p.get("repo", "local"), p["status"],
+            p.get("description", ""), p.get("foreign", False))
+
+    def _fill_pkg_store(self, filtered):
+        # One splice replaces the whole list; the ListView renders only the
+        # visible rows, so there's no need to chunk widget creation any more.
+        items = [self._make_item(p) for p in filtered]
+        self.pkg_store.splice(0, self.pkg_store.get_n_items(), items)
+
     def _render_filter_results(self, filtered, filt):
-        if not self._alive:
+        if not self._alive or self._current_filter != filt:
             return False
-        # Only apply if filter hasn't changed since we started
-        if self._current_filter != filt:
-            return False
-
-        while self.pkg_listbox.get_first_child():
-            self.pkg_listbox.remove(self.pkg_listbox.get_first_child())
-
-        # Batch-append in chunks via idle to keep UI responsive
-        CHUNK = 100
+        self._fill_pkg_store(filtered)
         total = len(self._all_packages)
         shown = len(filtered)
-
-        def append_chunk(start):
-            if not self._alive or self._current_filter != filt:
-                return False
-            end = min(start + CHUNK, len(filtered))
-            for pkg in filtered[start:end]:
-                item = PackageItem(
-                    pkg["name"], pkg["version"],
-                    pkg.get("repo", "local"), pkg["status"],
-                    pkg.get("description", ""), pkg.get("foreign", False))
-                self.pkg_listbox.append(PackageRow(item))
-            if end < len(filtered):
-                GLib.idle_add(append_chunk, end)
-            return False
-
         self.pkg_count_label.set_label(
             f"{shown} of {total} packages" if shown != total else f"{total} packages")
-
         if shown == 0:
             self.list_stack.set_visible_child_name(
                 "empty_updates" if filt == "updates" and self._updates is not None
                 else "empty_generic")
         else:
             self.list_stack.set_visible_child_name("list")
-            GLib.idle_add(append_chunk, 0)
-
         return False
 
     # ── Search ────────────────────────────────────────────────────────────────
 
+    SEARCH_DEBOUNCE_MS = 280
+
+    def _cancel_search_timer(self):
+        if self._search_timer is not None:
+            GLib.source_remove(self._search_timer)
+            self._search_timer = None
+
     def _on_search_changed(self, entry):
         q = entry.get_text().strip()
+        self._cancel_search_timer()
         if not q:
             self._search_spinner.stop()
             self._search_results_stack.set_visible_child_name("idle")
             return
+        # Show the searching state immediately, but defer the actual
+        # (subprocess-spawning) search until typing pauses.
         self._search_results_stack.set_visible_child_name("searching")
         self._search_spinner.start()
+        self._search_timer = GLib.timeout_add(
+            self.SEARCH_DEBOUNCE_MS, self._run_search, q)
+
+    def _on_search_activate(self, *_):
+        q = self.search_entry.get_text().strip()
+        self._cancel_search_timer()
+        if not q:
+            self._search_results_stack.set_visible_child_name("idle")
+            return
+        self._search_results_stack.set_visible_child_name("searching")
+        self._search_spinner.start()
+        self._run_search(q)
+
+    def _run_search(self, q):
+        self._search_timer = None
 
         def worker(query):
             ql = query.lower()
@@ -966,13 +967,7 @@ class pachubWindow(Adw.ApplicationWindow):
                 GLib.idle_add(self._merge_and_show_search, remote, query)
 
         threading.Thread(target=worker, args=(q,), daemon=True).start()
-
-    def _on_search_activate(self, *_):
-        q = self.search_entry.get_text().strip()
-        if not q:
-            self._search_results_stack.set_visible_child_name("idle")
-            return
-        self._on_search_changed(self.search_entry)
+        return False   # one-shot: do not repeat the timeout
 
     def _show_search_results(self, results, query):
         if self.search_entry.get_text().strip().lower() != query.lower():
@@ -996,138 +991,48 @@ class pachubWindow(Adw.ApplicationWindow):
 
     def _populate_search_list(self, results):
         self._search_spinner.stop()
-        while self.search_listbox.get_first_child():
-            self.search_listbox.remove(self.search_listbox.get_first_child())
         if not results:
+            self.search_store.remove_all()
             if self._search_results_stack.get_visible_child_name() != "empty":
                 self._search_results_stack.set_visible_child_name("empty")
             return
-        for pkg in results:
-            item = PackageItem(
-                pkg["name"], pkg["version"],
-                pkg.get("repo", "local"), pkg["status"],
-                pkg.get("description", ""), pkg.get("foreign", False))
-            self.search_listbox.append(PackageRow(item))
+        items = [self._make_item(p) for p in results]
+        self.search_store.splice(0, self.search_store.get_n_items(), items)
         n = len(results)
         self._search_count_lbl.set_label(f"{n} result{'s' if n != 1 else ''}")
         # Only switch to results page if not already there — avoids any redraw flash
         if self._search_results_stack.get_visible_child_name() != "results":
             self._search_results_stack.set_visible_child_name("results")
 
-    def _on_search_pkg_selected(self, listbox, row):
-        if row is None:
+    def _on_search_activated(self, pkg):
+        if pkg is None:
             return
-        pkg = row.pkg
         self._selected_pkg = pkg
         installed = pkg.pkg_status in ("installed", "update")
-        self._search_btn_install.set_sensitive(not installed)
+        # An "update" package is installed but upgradable — Install stays
+        # active and runs `pacman -S`, which upgrades that single package.
+        can_install = pkg.pkg_status != "installed"
+        install_label = "Update" if pkg.pkg_status == "update" else "Install"
+        self._set_btn_label(self._search_btn_install, install_label)
+        self._set_btn_label(self.search_panel.btn_install, install_label)
+        self._search_btn_install.set_sensitive(can_install)
         self._search_btn_remove.set_sensitive(installed)
-        self.sd_btn_install.set_sensitive(not installed)
-        self.sd_btn_remove.set_sensitive(installed)
-        self.sd_btn_reinstall.set_sensitive(installed)
-        self._show_search_detail(pkg)
-
-    def _show_search_detail(self, pkg):
-        """Populate the search page's own detail panel."""
-        self.sd_name.set_label(pkg.pkg_name)
-        self.sd_desc.set_label(pkg.pkg_description or "No description available.")
-        self.sd_icon.set_from_icon_name(pkg_icon(pkg.pkg_name))
-
-        repo_str = "aur" if pkg.pkg_foreign else (pkg.pkg_repo or "local").lower()
-        self.sd_repo_badge.set_label(repo_str.upper())
-        for cls in REPO_BADGE_CLASS.values():
-            self.sd_repo_badge.remove_css_class(cls)
-        self.sd_repo_badge.add_css_class(REPO_BADGE_CLASS.get(repo_str, "badge-local"))
-        self.sd_ver_badge.set_label(pkg.pkg_version)
-
-        for cls in ("status-installed", "status-available", "status-update", "status-foreign"):
-            self.sd_status.remove_css_class(cls)
-        if pkg.pkg_status == "update":
-            self.sd_status.set_label("UPDATE AVAILABLE")
-            self.sd_status.add_css_class("status-update")
-        elif pkg.pkg_status == "installed":
-            if pkg.pkg_foreign:
-                self.sd_status.set_label("INSTALLED (AUR)")
-                self.sd_status.add_css_class("status-foreign")
-            else:
-                self.sd_status.set_label("INSTALLED")
-                self.sd_status.add_css_class("status-installed")
-        else:
-            self.sd_status.set_label("AVAILABLE")
-            self.sd_status.add_css_class("status-available")
-
-        self.search_detail_stack.set_visible_child_name("detail")
-        for row in self.sd_info_rows.values():
-            if isinstance(row, Adw.ActionRow):
-                row.set_subtitle("…")
-        for exp_row, _ in self.sd_dep_rows.values():
-            exp_row.set_subtitle("…")
-        self.sd_raw_text.set_label("Loading…")
-        while self.sd_files_listbox.get_first_child():
-            self.sd_files_listbox.remove(self.sd_files_listbox.get_first_child())
-        self.sd_files_count_lbl.set_label("Loading…")
-        self._sd_files_all = []
-
-        def worker():
-            info  = get_package_info(pkg.pkg_name)
-            files = get_package_files(pkg.pkg_name)
-            if self._alive:
-                GLib.idle_add(self._populate_search_detail, info, files)
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _populate_search_detail(self, raw, files):
-        self.sd_raw_text.set_label(raw)
-        parsed = self._parse_pkginfo(raw)
-        field_map = {
-            "URL": "URL", "Licenses": "Licenses", "Groups": "Groups",
-            "Depends On": "Depends On", "Optional Deps": "Optional Deps",
-            "Conflicts With": "Conflicts With", "Provides": "Provides", "Replaces": "Replaces",
-            "Installed Size": "Installed Size", "Packager": "Packager",
-            "Build Date": "Build Date", "Install Date": "Install Date",
-            "Install Reason": "Install Reason",
-        }
-        for pk, rk in field_map.items():
-            val = parsed.get(pk, "—") or "—"
-            if val in ("None", ""):
-                val = "—"
-            if rk in self.sd_dep_rows:
-                exp_row, flow = self.sd_dep_rows[rk]
-                self._populate_dep_flow_widget(flow, exp_row, val, in_search=True)
-            elif rk in self.sd_info_rows:
-                self.sd_info_rows[rk].set_subtitle(GLib.markup_escape_text(val))
-        self.sd_arch_badge.set_label(parsed.get("Architecture", "x86_64"))
-        self._sd_files_all = files
-        self._populate_sd_files(files)
-        return False
-
-    def _populate_sd_files(self, files):
-        while self.sd_files_listbox.get_first_child():
-            self.sd_files_listbox.remove(self.sd_files_listbox.get_first_child())
-        q = self.sd_files_search.get_text().lower().strip()
-        shown = []
-        for line in files:
-            parts = line.split(None, 1)
-            path = parts[1] if len(parts) == 2 else line
-            if not q or q in path.lower():
-                shown.append(path)
-        for path in shown:
-            row = Gtk.ListBoxRow()
-            row.set_activatable(False)
-            lbl = Gtk.Label(label=path)
-            lbl.set_halign(Gtk.Align.START); lbl.set_selectable(True)
-            lbl.add_css_class("monospace"); lbl.add_css_class("caption")
-            lbl.set_margin_start(12); lbl.set_margin_top(4); lbl.set_margin_bottom(4)
-            row.set_child(lbl)
-            self.sd_files_listbox.append(row)
-        total = sum(1 for l in files if len(l.split(None, 1)) >= 2)
-        self.sd_files_count_lbl.set_label(
-            f"{len(shown)} of {total} files" if q else f"{total} files")
-
-    def _on_sd_files_search(self, entry):
-        if hasattr(self, "_sd_files_all"):
-            self._populate_sd_files(self._sd_files_all)
+        self.search_panel.btn_install.set_sensitive(can_install)
+        self.search_panel.btn_remove.set_sensitive(installed)
+        self.search_panel.btn_reinstall.set_sensitive(installed)
+        self.search_panel.btn_downgrade.set_sensitive(installed)
+        self._show_detail(self.search_panel, pkg)
 
     # ── Nav ───────────────────────────────────────────────────────────────────
+
+    def _grab_search_focus(self):
+        # Run-once idle callback: grab_focus() returns True, so passing it
+        # straight to GLib.idle_add would re-run it on every idle cycle —
+        # repeatedly re-selecting the entry's text so each typed character
+        # replaces the previous one. Returning False removes the idle source.
+        self.search_entry.grab_focus()
+        self.search_entry.set_position(-1)   # cursor to end, clears the selection
+        return False
 
     def _on_nav_selected(self, listbox, row):
         self.repo_listbox.unselect_all()
@@ -1139,7 +1044,7 @@ class pachubWindow(Adw.ApplicationWindow):
         if key == "search":
             self.main_stack.set_visible_child_name("search")
             self._current_filter = "search"
-            GLib.idle_add(self.search_entry.grab_focus)
+            GLib.idle_add(self._grab_search_focus)
             return
         if key == "orphans":
             self._on_show_orphans()
@@ -1171,91 +1076,96 @@ class pachubWindow(Adw.ApplicationWindow):
 
     # ── Package detail ────────────────────────────────────────────────────────
 
-    def _on_pkg_selected(self, listbox, row):
-        if row is None:
+    def _on_pkg_activated(self, pkg):
+        if pkg is None:
             return
-        pkg = row.pkg
         self._selected_pkg = pkg
         installed = pkg.pkg_status in ("installed", "update")
-        self.btn_install.set_sensitive(not installed)
+        # An "update" package is installed but upgradable — Install stays
+        # active and runs `pacman -S`, which upgrades that single package.
+        can_install = pkg.pkg_status != "installed"
+        install_label = "Update" if pkg.pkg_status == "update" else "Install"
+        self._set_btn_label(self.btn_install, install_label)
+        self._set_btn_label(self.detail_panel.btn_install, install_label)
+        self.btn_install.set_sensitive(can_install)
         self.btn_remove.set_sensitive(installed)
-        self.detail_btn_install.set_sensitive(not installed)
-        self.detail_btn_remove.set_sensitive(installed)
-        self.detail_btn_reinstall.set_sensitive(installed)
-        self._show_pkg_detail(pkg)
+        self.detail_panel.btn_install.set_sensitive(can_install)
+        self.detail_panel.btn_remove.set_sensitive(installed)
+        self.detail_panel.btn_reinstall.set_sensitive(installed)
+        self.detail_panel.btn_downgrade.set_sensitive(installed)
+        self._show_detail(self.detail_panel, pkg)
 
-    def _show_pkg_detail(self, pkg):
-        self.detail_name.set_label(pkg.pkg_name)
-        self.detail_desc.set_label(pkg.pkg_description or "No description available.")
-        self.detail_icon.set_from_icon_name(pkg_icon(pkg.pkg_name))
+    def _set_status_pill(self, panel, status, foreign):
+        for cls in ("status-installed", "status-available", "status-update", "status-foreign"):
+            panel.status.remove_css_class(cls)
+        if status == "update":
+            panel.status.set_label("UPDATE AVAILABLE")
+            panel.status.add_css_class("status-update")
+        elif status == "installed":
+            if foreign:
+                panel.status.set_label("INSTALLED (AUR)")
+                panel.status.add_css_class("status-foreign")
+            else:
+                panel.status.set_label("INSTALLED")
+                panel.status.add_css_class("status-installed")
+        else:
+            panel.status.set_label("AVAILABLE")
+            panel.status.add_css_class("status-available")
+
+    def _show_detail(self, panel, pkg):
+        """Fill `panel`'s hero with `pkg`, then load its info/files in a thread."""
+        panel.name.set_label(pkg.pkg_name)
+        panel.desc.set_label(pkg.pkg_description or "No description available.")
+        panel.icon.set_from_icon_name(pkg_icon(pkg.pkg_name))
 
         repo_str = "aur" if pkg.pkg_foreign else (pkg.pkg_repo or "local").lower()
-        self.detail_repo_badge.set_label(repo_str.upper())
+        panel.repo_badge.set_label(repo_str.upper())
         for cls in REPO_BADGE_CLASS.values():
-            self.detail_repo_badge.remove_css_class(cls)
-        self.detail_repo_badge.add_css_class(REPO_BADGE_CLASS.get(repo_str, "badge-local"))
-        self.detail_ver_badge.set_label(pkg.pkg_version)
+            panel.repo_badge.remove_css_class(cls)
+        panel.repo_badge.add_css_class(REPO_BADGE_CLASS.get(repo_str, "badge-local"))
+        panel.ver_badge.set_label(pkg.pkg_version)
+        self._set_status_pill(panel, pkg.pkg_status, pkg.pkg_foreign)
 
-        for cls in ("status-installed", "status-available", "status-update", "status-foreign"):
-            self.detail_status.remove_css_class(cls)
-        if pkg.pkg_status == "update":
-            self.detail_status.set_label("UPDATE AVAILABLE")
-            self.detail_status.add_css_class("status-update")
-        elif pkg.pkg_status == "installed":
-            if pkg.pkg_foreign:
-                self.detail_status.set_label("INSTALLED (AUR)")
-                self.detail_status.add_css_class("status-foreign")
-            else:
-                self.detail_status.set_label("INSTALLED")
-                self.detail_status.add_css_class("status-installed")
-        else:
-            self.detail_status.set_label("AVAILABLE")
-            self.detail_status.add_css_class("status-available")
-
-        self.detail_stack.set_visible_child_name("detail")
-        for row in self.info_rows.values():
+        panel.stack.set_visible_child_name("detail")
+        for row in panel.info_rows.values():
             if isinstance(row, Adw.ActionRow):
                 row.set_subtitle("…")
-        for exp_row, _ in self._dep_rows.values():
+        for exp_row, _ in panel.dep_rows.values():
             exp_row.set_subtitle("…")
-        self.raw_text.set_label("Loading…")
-        while self.files_listbox.get_first_child():
-            self.files_listbox.remove(self.files_listbox.get_first_child())
-        self.files_count_lbl.set_label("Loading…")
-        self._pkg_files_all = []
+        panel.raw_text.set_label("Loading…")
+        panel.set_files_loading()
 
         def worker():
             info  = get_package_info(pkg.pkg_name)
             files = get_package_files(pkg.pkg_name)
             if self._alive:
-                GLib.idle_add(self._populate_detail, info, files)
+                GLib.idle_add(self._populate_detail, panel, info, files)
         threading.Thread(target=worker, daemon=True).start()
 
-    def _populate_detail(self, raw, files):
-        self.raw_text.set_label(raw)
+    def _populate_detail(self, panel, raw, files):
+        panel.raw_text.set_label(raw)
         parsed = self._parse_pkginfo(raw)
-        field_map = {
-            "URL": "URL", "Licenses": "Licenses", "Groups": "Groups",
-            "Depends On": "Depends On", "Optional Deps": "Optional Deps",
-            "Conflicts With": "Conflicts With", "Provides": "Provides", "Replaces": "Replaces",
-            "Installed Size": "Installed Size", "Packager": "Packager",
-            "Build Date": "Build Date", "Install Date": "Install Date",
-            "Install Reason": "Install Reason",
-        }
-        for pk, rk in field_map.items():
-            val = parsed.get(pk, "—") or "—"
+        for key in DetailPanel.INFO_KEYS:
+            val = parsed.get(key, "—") or "—"
             if val in ("None", ""):
                 val = "—"
-            if rk in self._dep_rows:
-                exp_row, flow = self._dep_rows[rk]
-                self._populate_dep_flow(flow, exp_row, val)
-            elif rk in self.info_rows:
-                self.info_rows[rk].set_subtitle(GLib.markup_escape_text(val))
-        self.detail_arch_badge.set_label(parsed.get("Architecture", "x86_64"))
-        self._pkg_files_all = files
-        self._populate_files(files)
+            if key in panel.dep_rows:
+                exp_row, flow = panel.dep_rows[key]
+                self._populate_dep_flow(panel, flow, exp_row, val)
+            elif key in panel.info_rows:
+                self._set_info_subtitle(panel.info_rows[key], key, val)
+        panel.arch_badge.set_label(parsed.get("Architecture", "x86_64"))
+        panel.set_files(files)
         return False
 
+
+    def _set_info_subtitle(self, row, key, val):
+        """Set an ActionRow subtitle, rendering URL fields as a clickable link."""
+        esc = GLib.markup_escape_text(val)
+        if key == "URL" and val.startswith(("http://", "https://")):
+            row.set_subtitle(f'<a href="{esc}">{esc}</a>')
+        else:
+            row.set_subtitle(esc)
 
     def _parse_pkginfo(self, raw):
         """Parse pacman -Qi / -Si output handling multi-line values correctly."""
@@ -1272,10 +1182,7 @@ class pachubWindow(Adw.ApplicationWindow):
                 parsed[current_key] = parsed[current_key] + " " + line.strip()
         return parsed
 
-    def _populate_dep_flow(self, flow, exp_row, val):
-        self._populate_dep_flow_widget(flow, exp_row, val, in_search=False)
-
-    def _populate_dep_flow_widget(self, flow, exp_row, val, in_search=False):
+    def _populate_dep_flow(self, panel, flow, exp_row, val):
         while flow.get_first_child():
             flow.remove(flow.get_first_child())
         if val == "—":
@@ -1302,31 +1209,34 @@ class pachubWindow(Adw.ApplicationWindow):
         seen = set()
         dep_names = [d for d in dep_names if not (d in seen or seen.add(d))]
         exp_row.set_subtitle(f"{len(dep_names)} package{'s' if len(dep_names) != 1 else ''}")
-        for dep in dep_names:
+        # Cap the chip count — fields like "Required By" can list thousands of
+        # packages, and one Gtk.Button each would be slow to build.
+        CHIP_CAP = 80
+        for dep in dep_names[:CHIP_CAP]:
             btn = Gtk.Button(label=dep)
             btn.add_css_class("dep-chip")
             btn.set_tooltip_text(f"Look up {dep}")
-            if in_search:
-                btn.connect("clicked", lambda b, name=dep: self._search_dep(name))
-            else:
-                btn.connect("clicked", lambda b, name=dep: self._lookup_dep_in_list(name))
+            btn.connect("clicked", lambda b, name=dep: panel.dep_callback(name))
             flow.append(btn)
+        if len(dep_names) > CHIP_CAP:
+            more = Gtk.Label(label=f"+{len(dep_names) - CHIP_CAP} more")
+            more.add_css_class("dim-label"); more.add_css_class("caption")
+            flow.append(more)
+
+    def _highlight_in_store(self, store, selection, listview, pkg_name):
+        """Select (but do not activate) the row for pkg_name; scroll it into view."""
+        for i in range(store.get_n_items()):
+            if store.get_item(i).pkg_name == pkg_name:
+                selection.set_selected(i)
+                listview.scroll_to(i, Gtk.ListScrollFlags.FOCUS, None)
+                return True
+        return False
 
     def _lookup_dep_in_list(self, pkg_name):
         """Highlight dependency in the middle panel only; leave the right panel unchanged."""
-        def _highlight_in_list():
-            row = self.pkg_listbox.get_first_child()
-            while row:
-                if hasattr(row, "pkg") and row.pkg.pkg_name == pkg_name:
-                    # Select row visually but do NOT trigger detail panel update
-                    self.pkg_listbox.select_row(row)
-                    row.grab_focus()
-                    return True
-                row = row.get_next_sibling()
-            return False
-
         # Try current list first
-        if _highlight_in_list():
+        if self._highlight_in_store(self.pkg_store, self.pkg_selection,
+                                    self.pkg_listview, pkg_name):
             return
 
         # Switch to "installed" filter to make it visible, then highlight
@@ -1334,7 +1244,8 @@ class pachubWindow(Adw.ApplicationWindow):
         self.nav_listbox.select_row(self._nav_rows["installed"])
 
         def after_filter():
-            _highlight_in_list()
+            self._highlight_in_store(self.pkg_store, self.pkg_selection,
+                                     self.pkg_listview, pkg_name)
             return False
 
         self._apply_filter_then(after_filter)
@@ -1364,78 +1275,37 @@ class pachubWindow(Adw.ApplicationWindow):
         threading.Thread(target=do_filter, daemon=True).start()
 
     def _render_filter_results_then(self, filtered, filt, callback):
-        """Same as _render_filter_results but fires callback after first chunk."""
+        """Same as _render_filter_results but fires `callback` once rendered."""
         if not self._alive or self._current_filter != filt:
             return False
-
-        while self.pkg_listbox.get_first_child():
-            self.pkg_listbox.remove(self.pkg_listbox.get_first_child())
-
-        CHUNK = 100
+        self._fill_pkg_store(filtered)
         total = len(self._all_packages)
         shown = len(filtered)
-
-        def append_chunk(start, first=False):
-            if not self._alive or self._current_filter != filt:
-                return False
-            end = min(start + CHUNK, len(filtered))
-            for pkg in filtered[start:end]:
-                item = PackageItem(
-                    pkg["name"], pkg["version"],
-                    pkg.get("repo", "local"), pkg["status"],
-                    pkg.get("description", ""), pkg.get("foreign", False))
-                self.pkg_listbox.append(PackageRow(item))
-            if first and callback:
-                GLib.idle_add(callback)
-            if end < len(filtered):
-                GLib.idle_add(append_chunk, end, False)
-            return False
-
         self.pkg_count_label.set_label(
             f"{shown} of {total} packages" if shown != total else f"{total} packages")
-
         if shown == 0:
             self.list_stack.set_visible_child_name(
                 "empty_updates" if filt == "updates" and self._updates is not None
                 else "empty_generic")
-            if callback:
-                GLib.idle_add(callback)
         else:
             self.list_stack.set_visible_child_name("list")
-            GLib.idle_add(append_chunk, 0, True)
-
+        if callback:
+            GLib.idle_add(callback)
         return False
 
     def _search_dep(self, pkg_name):
         """Highlight dependency in the search results list only — no entry change, no flicker."""
-        ql = pkg_name.lower()
-
-        def _highlight_in_search_list():
-            row = self.search_listbox.get_first_child()
-            while row:
-                if hasattr(row, "pkg") and row.pkg.pkg_name == pkg_name:
-                    self.search_listbox.select_row(row)
-                    row.grab_focus()
-                    return True
-                row = row.get_next_sibling()
-            return False
-
         # If already in the current results list, just highlight it
-        if _highlight_in_search_list():
+        if self._highlight_in_store(self.search_store, self.search_selection,
+                                    self.search_listview, pkg_name):
             return
 
         # Not visible — find it in _all_packages and insert it at the top of the list
         for pkg in self._all_packages:
             if pkg["name"] == pkg_name:
-                item = PackageItem(
-                    pkg["name"], pkg["version"],
-                    pkg.get("repo", "local"), pkg["status"],
-                    pkg.get("description", ""), pkg.get("foreign", False))
-                row = PackageRow(item)
-                self.search_listbox.prepend(row)
-                self.search_listbox.select_row(row)
-                row.grab_focus()
-                n_str = self._search_count_lbl.get_label()
+                self.search_store.insert(0, self._make_item(pkg))
+                self.search_selection.set_selected(0)
+                self.search_listview.scroll_to(0, Gtk.ListScrollFlags.FOCUS, None)
                 return
 
         # Not in cache at all — fetch in background and prepend when ready
@@ -1451,56 +1321,29 @@ class pachubWindow(Adw.ApplicationWindow):
             if r["name"] == pkg_name:
                 if r["name"] not in {p["name"] for p in self._all_packages}:
                     self._all_packages.append(r)
-                item = PackageItem(r["name"], r["version"],
-                                   r.get("repo", "local"), r["status"],
-                                   r.get("description", ""), r.get("foreign", False))
-                row = PackageRow(item)
-                self.search_listbox.prepend(row)
-                self.search_listbox.select_row(row)
-                row.grab_focus()
+                self.search_store.insert(0, self._make_item(r))
+                self.search_selection.set_selected(0)
+                self.search_listview.scroll_to(0, Gtk.ListScrollFlags.FOCUS, None)
                 return
         return False
 
-    def _populate_files(self, files):
-        while self.files_listbox.get_first_child():
-            self.files_listbox.remove(self.files_listbox.get_first_child())
-        q = self.files_search.get_text().lower().strip()
-        shown = []
-        for line in files:
-            parts = line.split(None, 1)
-            path = parts[1] if len(parts) == 2 else line
-            if not q or q in path.lower():
-                shown.append(path)
-        for path in shown:
-            row = Gtk.ListBoxRow()
-            row.set_activatable(False)
-            lbl = Gtk.Label(label=path)
-            lbl.set_halign(Gtk.Align.START); lbl.set_selectable(True)
-            lbl.add_css_class("monospace"); lbl.add_css_class("caption")
-            lbl.set_margin_start(12); lbl.set_margin_top(4); lbl.set_margin_bottom(4)
-            row.set_child(lbl)
-            self.files_listbox.append(row)
-        total = sum(1 for l in files if len(l.split(None, 1)) >= 2)
-        self.files_count_lbl.set_label(
-            f"{len(shown)} of {total} files" if q else f"{total} files")
-
-    def _on_files_search(self, entry):
-        self._populate_files(self._pkg_files_all)
-
     # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _toast(self, text, timeout=4):
+        toast = Adw.Toast()
+        toast.set_title(text)
+        toast.set_timeout(timeout)
+        try:
+            self._toast_overlay.add_toast(toast)
+        except AttributeError:
+            pass
 
     def _run_terminal(self, cmd, title, on_success=None):
         def _on_done(code):
             if code == 0:
                 invalidate_cache()
-            toast = Adw.Toast()
-            toast.set_title(
-                f"✓ {title} completed" if code == 0 else f"✗ {title} failed (exit {code})")
-            toast.set_timeout(4)
-            try:
-                self._toast_overlay.add_toast(toast)
-            except AttributeError:
-                pass
+            self._toast(f"✓ {title} completed" if code == 0
+                        else f"✗ {title} failed (exit {code})")
             self._load_packages()
         run_terminal_dialog(self, cmd, title, on_success=on_success, on_done_extra=_on_done)
 
@@ -1509,7 +1352,7 @@ class pachubWindow(Adw.ApplicationWindow):
         self._updates = None
         self.search_entry.set_text("")
         self._search_results_stack.set_visible_child_name("idle")
-        self.detail_stack.set_visible_child_name("empty")
+        self.detail_panel.stack.set_visible_child_name("empty")
         self._selected_pkg = None
         self.btn_install.set_sensitive(False)
         self.btn_remove.set_sensitive(False)
@@ -1521,13 +1364,20 @@ class pachubWindow(Adw.ApplicationWindow):
         self._run_terminal("sudo -S pacman -Sy --noconfirm", "Sync Databases")
 
     def _on_upgrade(self, *_):
+        if get_setting("show_news_before_upgrade"):
+            show_news_dialog(self, self._do_upgrade)
+        else:
+            self._do_upgrade()
+
+    def _do_upgrade(self):
         def _after():
             self.update_banner.set_revealed(False)
             self._updates = []
             self.stat_updates._num.set_label("0")
             self._nav_rows["updates"].set_count(0)
+        # Use the AUR helper if present so repo *and* AUR packages are upgraded.
         helper = self._get_aur_helper()
-        cmd = [helper, "-Syu", "--noconfirm"] if helper else ["sudo", "-S", "pacman", "-Syu", "--noconfirm"]
+        cmd = f"{helper} -Syu --noconfirm" if helper else "sudo -S pacman -Syu --noconfirm"
         self._run_terminal(cmd, "System Upgrade", on_success=_after)
 
     def _on_clean_cache(self, *_):
@@ -1536,8 +1386,11 @@ class pachubWindow(Adw.ApplicationWindow):
             "Clean Cache")
 
     def _on_check_updates(self, *_):
+        helper = self._get_aur_helper()
+        aur = (f"; echo; echo '== AUR =='; {helper} -Qua 2>/dev/null") if helper else ""
         self._run_terminal(
-            "checkupdates 2>/dev/null || pacman -Qu 2>/dev/null || echo 'No updates available'",
+            f"{{ checkupdates 2>/dev/null || pacman -Qu 2>/dev/null; }}{aur}"
+            "; echo; echo 'Done.'",
             "Check for Updates")
 
     def _on_manage_repos(self, *_):
@@ -1552,16 +1405,137 @@ class pachubWindow(Adw.ApplicationWindow):
     def _on_show_sysinfo(self, *_):
         show_sysinfo_dialog(self)
 
+    def _on_show_history(self, *_):
+        show_history_dialog(self)
+
+    def _on_show_pacdiff(self, *_):
+        show_pacdiff_dialog(self, self._run_terminal)
+
+    def _on_view_pkgbuild(self, *_):
+        pkg = self._selected_pkg
+        if not pkg:
+            self._toast("Select a package first")
+            return
+        if not pkg.pkg_foreign:
+            self._toast("PKGBUILD is only available for AUR packages")
+            return
+        show_pkgbuild_dialog(self, pkg.pkg_name, self._on_install)
+
+    def _on_toggle_hold(self, *_):
+        pkg = self._selected_pkg
+        if not pkg:
+            self._toast("Select a package first")
+            return
+        currently = pkg.pkg_name in get_ignored_packages()
+        tmp = set_package_ignored(pkg.pkg_name, not currently)
+        if tmp is None:
+            self._toast("Could not read /etc/pacman.conf")
+            return
+        verb = "Unhold" if currently else "Hold"
+        self._run_terminal(
+            f"sudo -S install -m644 {shlex.quote(tmp)} /etc/pacman.conf",
+            f"{verb} {pkg.pkg_name}")
+
+    def _on_preferences(self, *_):
+        show_preferences(self, self._on_settings_changed)
+
+    def _on_settings_changed(self):
+        # AUR-helper / include-AUR changes can affect the update set — re-check.
+        if self._alive:
+            threading.Thread(target=self._bg_check_updates, daemon=True).start()
+
+    def _on_show_shortcuts(self, *_):
+        show_shortcuts_dialog(self)
+
+    def _on_focus_search(self, *_):
+        self.main_stack.set_visible_child_name("search")
+        self._current_filter = "search"
+        self.nav_listbox.unselect_all()
+        self.repo_listbox.unselect_all()
+        GLib.idle_add(self._grab_search_focus)
+
+    def _on_downgrade(self, *_):
+        if not self._selected_pkg:
+            self._toast("Select a package first")
+            return
+        show_downgrade_dialog(self, self._selected_pkg.pkg_name, self._run_terminal)
+
+    def _on_mark_explicit(self, *_):
+        pkg = self._selected_pkg
+        if not pkg:
+            self._toast("Select a package first")
+            return
+        self._run_terminal(
+            f"sudo -S pacman -D --asexplicit {shlex.quote(pkg.pkg_name)}",
+            f"Mark {pkg.pkg_name} as explicit", on_success=self._refresh_selected_pkg)
+
+    def _on_mark_asdeps(self, *_):
+        pkg = self._selected_pkg
+        if not pkg:
+            self._toast("Select a package first")
+            return
+        self._run_terminal(
+            f"sudo -S pacman -D --asdeps {shlex.quote(pkg.pkg_name)}",
+            f"Mark {pkg.pkg_name} as dependency", on_success=self._refresh_selected_pkg)
+
+    def _on_export_pkgs(self, *_):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Export Package List")
+        dialog.set_initial_name("pachub-packages.txt")
+        dialog.save(self, None, self._export_save_done)
+
+    def _export_save_done(self, dialog, result):
+        try:
+            gfile = dialog.save_finish(result)
+        except GLib.Error:
+            return   # user cancelled
+        path = gfile.get_path()
+        pkgs = get_explicit_packages()
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(pkgs) + "\n")
+            self._toast(f"Exported {len(pkgs)} packages")
+        except OSError as e:
+            self._toast(f"Export failed: {e}")
+
+    def _on_import_pkgs(self, *_):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Import Package List")
+        dialog.open(self, None, self._import_open_done)
+
+    def _import_open_done(self, dialog, result):
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error:
+            return   # user cancelled
+        try:
+            with open(gfile.get_path()) as f:
+                names = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        except OSError as e:
+            self._toast(f"Could not read file: {e}")
+            return
+        if not names:
+            self._toast("No packages found in file")
+            return
+        quoted = " ".join(shlex.quote(n) for n in names)
+        helper = self._get_aur_helper()
+        if helper:
+            cmd = f"{helper} -S --needed --noconfirm {quoted}"
+        else:
+            cmd = f"sudo -S pacman -S --needed --noconfirm {quoted}"
+        self._run_terminal(cmd, f"Install {len(names)} packages")
+
     def _on_install(self, *_):
         if not self._selected_pkg:
             return
         pkg = self._selected_pkg
+        name = shlex.quote(pkg.pkg_name)
         if pkg.pkg_foreign:
             helper = self._get_aur_helper()
-            cmd = f"{helper} -S --noconfirm {pkg.pkg_name}" if helper \
-                  else f"sudo -S pacman -Sy --noconfirm {pkg.pkg_name}"
+            cmd = f"{helper} -S --noconfirm {name}" if helper \
+                  else f"sudo -S pacman -S --noconfirm {name}"
         else:
-            cmd = f"sudo -S pacman -Sy --noconfirm {pkg.pkg_name}"
+            cmd = f"sudo -S pacman -S --noconfirm {name}"
         self._run_terminal(cmd, f"Install {pkg.pkg_name}",
                            on_success=self._refresh_selected_pkg)
 
@@ -1569,31 +1543,37 @@ class pachubWindow(Adw.ApplicationWindow):
         if not self._selected_pkg:
             return
         pkg = self._selected_pkg
+
+        def do_remove():
+            self._run_terminal(
+                f"sudo -S pacman -R --noconfirm {shlex.quote(pkg.pkg_name)}",
+                f"Remove {pkg.pkg_name}",
+                on_success=self._refresh_selected_pkg)
+
+        if not get_setting("confirm_remove"):
+            do_remove()
+            return
+
         d = Adw.AlertDialog()
         d.set_heading(f"Remove {pkg.pkg_name}?")
         d.set_body(f"This will remove {pkg.pkg_name} ({pkg.pkg_version}) from your system.")
         d.add_response("cancel", "Cancel"); d.add_response("remove", "Remove")
         d.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
         d.set_default_response("cancel"); d.set_close_response("cancel")
-        def on_resp(dlg, resp):
-            if resp == "remove":
-                self._run_terminal(
-                    f"sudo -S pacman -R --noconfirm {pkg.pkg_name}",
-                    f"Remove {pkg.pkg_name}",
-                    on_success=self._refresh_selected_pkg)
-        d.connect("response", on_resp)
+        d.connect("response", lambda dlg, resp: resp == "remove" and do_remove())
         d.present(self)
 
     def _on_reinstall(self, *_):
         if not self._selected_pkg:
             return
         pkg = self._selected_pkg
+        name = shlex.quote(pkg.pkg_name)
         if pkg.pkg_foreign:
             helper = self._get_aur_helper()
-            cmd = f"{helper} -S --noconfirm {pkg.pkg_name}" if helper \
-                  else f"sudo -S pacman -Sy --noconfirm {pkg.pkg_name}"
+            cmd = f"{helper} -S --noconfirm {name}" if helper \
+                  else f"sudo -S pacman -S --noconfirm {name}"
         else:
-            cmd = f"sudo -S pacman -Sy --noconfirm {pkg.pkg_name}"
+            cmd = f"sudo -S pacman -S --noconfirm {name}"
         self._run_terminal(cmd, f"Reinstall {pkg.pkg_name}",
                            on_success=self._refresh_selected_pkg)
 
@@ -1601,38 +1581,51 @@ class pachubWindow(Adw.ApplicationWindow):
         if not self._selected_pkg:
             return
         pkg = self._selected_pkg
-        out, code = run_command(f"pacman -Qi '{pkg.pkg_name}' 2>/dev/null")
+        out, code = run_command(f"pacman -Qi {shlex.quote(pkg.pkg_name)} 2>/dev/null")
         pkg.pkg_status = "installed" if (code == 0 and out) else "available"
         installed = pkg.pkg_status == "installed"
         self.btn_install.set_sensitive(not installed)
         self.btn_remove.set_sensitive(installed)
         self._search_btn_install.set_sensitive(not installed)
         self._search_btn_remove.set_sensitive(installed)
-        self.detail_btn_install.set_sensitive(not installed)
-        self.detail_btn_remove.set_sensitive(installed)
-        self.detail_btn_reinstall.set_sensitive(installed)
-        self.sd_btn_install.set_sensitive(not installed)
-        self.sd_btn_remove.set_sensitive(installed)
-        self.sd_btn_reinstall.set_sensitive(installed)
-        for cls in ("status-installed", "status-available", "status-update", "status-foreign"):
-            self.detail_status.remove_css_class(cls)
-        if installed:
-            if pkg.pkg_foreign:
-                self.detail_status.set_label("INSTALLED (AUR)")
-                self.detail_status.add_css_class("status-foreign")
-            else:
-                self.detail_status.set_label("INSTALLED")
-                self.detail_status.add_css_class("status-installed")
-        else:
-            self.detail_status.set_label("AVAILABLE")
-            self.detail_status.add_css_class("status-available")
+        for panel in (self.detail_panel, self.search_panel):
+            panel.btn_install.set_sensitive(not installed)
+            self._set_btn_label(panel.btn_install, "Install")
+            panel.btn_remove.set_sensitive(installed)
+            panel.btn_reinstall.set_sensitive(installed)
+            panel.btn_downgrade.set_sensitive(installed)
+            self._set_status_pill(panel, pkg.pkg_status, pkg.pkg_foreign)
+        self._set_btn_label(self.btn_install, "Install")
+        self._set_btn_label(self._search_btn_install, "Install")
+        # If the package was a pending update and is now installed, drop it
+        # from the updates set so it leaves the Updates list right away.
+        if installed and self._updates and any(
+                u["name"] == pkg.pkg_name for u in self._updates):
+            self._updates = [u for u in self._updates
+                             if u["name"] != pkg.pkg_name]
+            n = len(self._updates)
+            self.stat_updates._num.set_label(str(n))
+            self._nav_rows["updates"].set_count(n)
+            if n == 0:
+                self.update_banner.set_revealed(False)
+            for p in self._all_packages:
+                if p["name"] == pkg.pkg_name:
+                    p["status"] = "installed"
+                    p.pop("new_version", None)
+            if self.main_stack.get_visible_child_name() != "search":
+                self._apply_filter()
         if installed:
             def worker():
                 info  = get_package_info(pkg.pkg_name)
                 files = get_package_files(pkg.pkg_name)
                 if self._alive:
-                    GLib.idle_add(self._populate_detail, info, files)
+                    GLib.idle_add(self._populate_both_panels, info, files)
             threading.Thread(target=worker, daemon=True).start()
+
+    def _populate_both_panels(self, info, files):
+        self._populate_detail(self.detail_panel, info, files)
+        self._populate_detail(self.search_panel, info, files)
+        return False
 
     def _get_aur_helper(self):
         if self._aur_helper_cache is None:

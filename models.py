@@ -1,13 +1,13 @@
 """
 PacHub — models.py
-GObject data model (PackageItem) and reusable GTK row widgets
-(PackageRow, NavRow) used throughout the UI.
+GObject data model (PackageItem), the virtualized package ListView factory
+(make_package_listview / PackageRowContent), and the sidebar NavRow.
 """
 
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, GObject, Pango
+from gi.repository import Gtk, Gio, GObject, Pango
 
 # ─── Repository badge mapping ─────────────────────────────────────────────────
 
@@ -83,46 +83,53 @@ class PackageItem(GObject.Object):
         self.pkg_foreign     = foreign
 
 
-# ─── Package list row ─────────────────────────────────────────────────────────
+# ─── Package list row (virtualized ListView) ─────────────────────────────────
 
-class PackageRow(Gtk.ListBoxRow):
-    def __init__(self, pkg):
-        super().__init__()
-        self.pkg = pkg
-        self.set_activatable(True)
+_STATUS_PILL_CSS = ("status-installed", "status-update")
+_REPO_BADGE_CSS = tuple(set(REPO_BADGE_CLASS.values()))
+
+
+class PackageRowContent(Gtk.Box):
+    """Recyclable row widget for the package ListView.
+
+    Built once per visible slot in `setup`, then re-bound to whatever
+    PackageItem scrolls into it via `bind` — so only ~screenful of widgets
+    ever exist, regardless of list size.
+    """
+    __gtype_name__ = 'PacHubPackageRowContent'
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.set_margin_top(9);    self.set_margin_bottom(9)
+        self.set_margin_start(10); self.set_margin_end(10)
         self.add_css_class("pkg-row")
 
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        box.set_margin_top(9);    box.set_margin_bottom(9)
-        box.set_margin_start(10); box.set_margin_end(10)
-
-        icon = Gtk.Image.new_from_icon_name(pkg_icon(pkg.pkg_name))
-        icon.set_pixel_size(20)
-        icon.set_valign(Gtk.Align.CENTER)
-        icon.add_css_class("dim-label")
-        box.append(icon)
+        self.icon = Gtk.Image()
+        self.icon.set_pixel_size(20)
+        self.icon.set_valign(Gtk.Align.CENTER)
+        self.icon.add_css_class("dim-label")
+        self.append(self.icon)
 
         info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         info_box.set_hexpand(True)
         info_box.set_valign(Gtk.Align.CENTER)
 
-        name_label = Gtk.Label(label=pkg.pkg_name)
-        name_label.set_halign(Gtk.Align.START)
-        name_label.add_css_class("body")
-        name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.name_label = Gtk.Label()
+        self.name_label.set_halign(Gtk.Align.START)
+        self.name_label.add_css_class("body")
+        self.name_label.set_ellipsize(Pango.EllipsizeMode.END)
         attrs = Pango.AttrList()
         attrs.insert(Pango.attr_weight_new(Pango.Weight.SEMIBOLD))
-        name_label.set_attributes(attrs)
-        info_box.append(name_label)
+        self.name_label.set_attributes(attrs)
+        info_box.append(self.name_label)
 
-        if pkg.pkg_description:
-            desc_label = Gtk.Label(label=pkg.pkg_description)
-            desc_label.set_halign(Gtk.Align.START)
-            desc_label.add_css_class("caption")
-            desc_label.add_css_class("dim-label")
-            desc_label.set_ellipsize(Pango.EllipsizeMode.END)
-            info_box.append(desc_label)
-        box.append(info_box)
+        self.desc_label = Gtk.Label()
+        self.desc_label.set_halign(Gtk.Align.START)
+        self.desc_label.add_css_class("caption")
+        self.desc_label.add_css_class("dim-label")
+        self.desc_label.set_ellipsize(Pango.EllipsizeMode.END)
+        info_box.append(self.desc_label)
+        self.append(info_box)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         right.set_valign(Gtk.Align.CENTER)
@@ -130,31 +137,68 @@ class PackageRow(Gtk.ListBoxRow):
 
         badges_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         badges_row.set_halign(Gtk.Align.END)
-
-        # "INSTALLED" pill for installed/update packages
-        if pkg.pkg_status in ("installed", "update"):
-            status_css = "status-update" if pkg.pkg_status == "update" else "status-installed"
-            status_text = "UPDATE" if pkg.pkg_status == "update" else "INSTALLED"
-            inst_badge = Gtk.Label(label=status_text)
-            inst_badge.add_css_class("row-status-pill")
-            inst_badge.add_css_class(status_css)
-            badges_row.append(inst_badge)
-
-        repo_str = "aur" if pkg.pkg_foreign else (pkg.pkg_repo or "local")
-        badge = Gtk.Label(label=repo_str.upper())
-        badge.add_css_class("badge")
-        badge.add_css_class(REPO_BADGE_CLASS.get(repo_str.lower(), "badge-local"))
-        badges_row.append(badge)
+        self.status_badge = Gtk.Label()
+        self.status_badge.add_css_class("row-status-pill")
+        badges_row.append(self.status_badge)
+        self.repo_badge = Gtk.Label()
+        self.repo_badge.add_css_class("badge")
+        badges_row.append(self.repo_badge)
         right.append(badges_row)
 
-        ver_label = Gtk.Label(label=pkg.pkg_version)
-        ver_label.add_css_class("caption")
-        ver_label.add_css_class("dim-label")
-        ver_label.set_halign(Gtk.Align.END)
-        right.append(ver_label)
+        self.ver_label = Gtk.Label()
+        self.ver_label.add_css_class("caption")
+        self.ver_label.add_css_class("dim-label")
+        self.ver_label.set_halign(Gtk.Align.END)
+        right.append(self.ver_label)
+        self.append(right)
 
-        box.append(right)
-        self.set_child(box)
+    def bind(self, pkg):
+        self.icon.set_from_icon_name(pkg_icon(pkg.pkg_name))
+        self.name_label.set_label(pkg.pkg_name)
+        self.desc_label.set_label(pkg.pkg_description or "")
+        self.desc_label.set_visible(bool(pkg.pkg_description))
+
+        # Status pill — only for installed/update; clear stale classes first
+        for cls in _STATUS_PILL_CSS:
+            self.status_badge.remove_css_class(cls)
+        if pkg.pkg_status in ("installed", "update"):
+            is_update = pkg.pkg_status == "update"
+            self.status_badge.set_label("UPDATE" if is_update else "INSTALLED")
+            self.status_badge.add_css_class("status-update" if is_update else "status-installed")
+            self.status_badge.set_visible(True)
+        else:
+            self.status_badge.set_visible(False)
+
+        # Repo badge — swap class on every rebind
+        repo_str = "aur" if pkg.pkg_foreign else (pkg.pkg_repo or "local")
+        for cls in _REPO_BADGE_CSS:
+            self.repo_badge.remove_css_class(cls)
+        self.repo_badge.set_label(repo_str.upper())
+        self.repo_badge.add_css_class(REPO_BADGE_CLASS.get(repo_str.lower(), "badge-local"))
+
+        self.ver_label.set_label(pkg.pkg_version or "")
+
+
+def make_package_listview(on_activate):
+    """Build a virtualized package ListView backed by a Gio.ListStore.
+
+    Returns (listview, store, selection). `on_activate(item)` fires on a single
+    click or Enter, with the activated PackageItem (or None).
+    """
+    store = Gio.ListStore(item_type=PackageItem)
+    selection = Gtk.SingleSelection(model=store)
+    selection.set_autoselect(False)
+    selection.set_can_unselect(True)
+
+    factory = Gtk.SignalListItemFactory()
+    factory.connect("setup", lambda f, li: li.set_child(PackageRowContent()))
+    factory.connect("bind", lambda f, li: li.get_child().bind(li.get_item()))
+
+    listview = Gtk.ListView(model=selection, factory=factory)
+    listview.add_css_class("navigation-sidebar")
+    listview.set_single_click_activate(True)
+    listview.connect("activate", lambda lv, pos: on_activate(store.get_item(pos)))
+    return listview, store, selection
 
 
 # ─── Sidebar navigation row ───────────────────────────────────────────────────
